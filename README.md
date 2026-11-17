@@ -3,8 +3,8 @@
 ![Marv OS: a chat editing a file, with the folders list on the left and the files dock on the right](.github/kernel/folders-files.png)
 
 Marv OS is a desktop app for running many coding agents on your own machine. It runs Marv, Claude Code, Codex, Gemini CLI,
-OpenCode and the other agents it detects on your computer (and any command you add yourself), each chat in its own
-terminal. Chats can work as a team, edit in their own git worktrees, and are checkpointed so you can go back. You set
+OpenCode and about fifteen other agents it detects on your computer (and any command you add yourself), each chat in its
+own terminal. Chats can work as a team, edit in their own git worktrees, and are checkpointed so you can go back. You set
 budgets and approvals, and you can let a chat keep working while you're away: it does only what you allowed, and
 anything that needs you waits on the Home screen. Screenshots in this repository use demo data.
 
@@ -17,7 +17,7 @@ More at [flologixai.com/marv-os](https://www.flologixai.com/marv-os).
 | --- | --- |
 | Linux x86_64 | AppImage or `.deb` (a CLI-only `.tar.gz` is also published) |
 | macOS, Apple silicon | `.dmg` |
-| Windows x64 | installer (`-setup.exe`) |
+| Windows x64 | installer (`-setup.exe`), from 1.0.0-rc.2 on |
 
 Check the files against `SHA256SUMS` from the same release.
 
@@ -29,8 +29,10 @@ The macOS and Windows builds are not signed yet, so each asks once.
   Privacy & Security and click **Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/Marv.app`).
 - **Windows:** SmartScreen asks before the first run. Choose **More info**, then **Run anyway**.
 
-Commands run in a sandbox (bubblewrap on Linux, Seatbelt on macOS). On Linux, install `bwrap` if your distribution
-doesn't ship it.
+Commands run in a sandbox: bubblewrap on Linux, Seatbelt on macOS. On Linux, install `bwrap` if your distribution
+doesn't ship it (on Ubuntu 24.04 also run `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`). Windows has
+no sandbox yet: each command asks you before it runs. An AppContainer sandbox is in testing
+(`MARV_APPCONTAINER=1`).
 
 ## Build from source
 
@@ -72,7 +74,8 @@ For a quick local install on Linux or macOS, run `app/install-desktop.sh`. The t
 
 ## Free and paid
 
-The app and Marv are free and open source under Apache-2.0. FlologixAI also offers optional paid plans (Founding, and
+The app and Marv are free and open source under Apache-2.0. Teams and Apps need a free Marv account (Google, GitHub or
+email sign-in under Settings > Account). FlologixAI also offers optional paid plans (Founding, and
 Pro with models included) as a separate service. You don't need one to use Marv OS: bring your own model key, a
 subscription you already pay for, or a local model.
 
