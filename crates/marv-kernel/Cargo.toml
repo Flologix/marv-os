@@ -1,0 +1,26 @@
+[package]
+name = "marv-kernel"
+description = "Marv's runtime kernel: who the agents are, and (by phase) policies, the scheduler, the registry and the event log. Pure data and decisions: no sockets, no runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false }
+# Runtime-kernel §15.4 (review P3-1): the person's daily timers at a local time in their IANA zone, across DST.
+chrono-tz = { version = "0.10", default-features = false }
+# The rules file (`store`): private atomic writes and the cross-process file lock.
+marv-fs.workspace = true
+# A write set's paths are checked as printable as the terminal's (`printable::is_bidi`).
+marv-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

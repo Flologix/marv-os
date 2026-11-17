@@ -1,0 +1,15 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-",
+      "files": {
+        "libexec/marv-os/marv": "binaries/marv",
+        "MacOS/lazygit": "binaries/lazygit",
+        "Resources/lazygit-LICENSE.txt": "binaries/lazygit-LICENSE.txt"
+      }
+    }
+  }
+}

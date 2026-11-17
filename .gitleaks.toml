@@ -1,0 +1,19 @@
+# Gitleaks configuration: the default rules, plus an allowlist of known test fixtures.
+# Every entry below is made-up text that tests use to prove Marv hides or refuses secrets. None is a real credential.
+title = "Marv OS"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fake keys inside redaction tests"
+paths = [
+  # Fake OpenRouter/ZAI/GitHub/JWT-shaped strings that the app log's scrubber must remove.
+  '''app/src-tauri/src/applog\.rs''',
+  # Fake keys and an AWS-shaped id that the chat-read scrubber must remove.
+  '''crates/marv-mesh/src/chat_read\.rs''',
+  # A fake API_KEY in a .env fixture that tool output must not show.
+  '''crates/marv-tools/src/shown\.rs''',
+  # A fake GitHub-token-shaped string in tool output that a guard checks is fenced and never trusted.
+  '''tests/guards/tests/chat_read\.rs''',
+]

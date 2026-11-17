@@ -1,0 +1,127 @@
+# Marv OS on Windows (x86_64): builds marv.exe and the desktop's NSIS installer (Marv_<version>_x64-setup.exe) on a
+# GitHub-hosted windows-latest runner, launches the built marv-desktop.exe and waits for it to reach `ready`
+# (packaging/desktop/smoke-windows.ps1), and uploads the installer. Unsigned: SmartScreen asks once ("More info",
+# "Run anyway") until a code-signing certificate is set up.
+#
+# By hand (Actions > Windows > Run workflow), or by pushing a windows-build/<name> branch, never on every change:
+# Windows runners are slow and cost more minutes. Type-checking for Windows on every change is cheap and local:
+# scripts/windows/check.sh.
+name: Windows
+
+on:
+  # A branch pushed as windows-build/<anything> builds too: Run workflow only exists once this file is on main.
+  push:
+    branches: ["windows-build/**"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version stamped into the build, e.g. 1.0.0-beta.3"
+        required: true
+        type: string
+        default: "0.0.0-windows"
+  # The release (kernel-release.yml) builds its Windows installer here: `version` is the release's, or its tag
+  # (os-v<version>: the prefix is dropped below).
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version || '0.0.0-windows' }}
+        run: |
+          version=${INPUT_VERSION#os-v}
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$' || {
+            echo "'$version' isn't a version like 1.0.0-beta.1"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: os-desktop-windows
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build marv.exe
+        shell: bash
+        run: |
+          cargo build --release -p marv-cli
+          mkdir -p app/src-tauri/binaries
+          cp target/release/marv.exe app/src-tauri/binaries/marv.exe
+          target/release/marv.exe --version
+      # The Git tab runs lazygit: the installer brings its own (MIT), next to marv-desktop.exe, for people who haven't
+      # installed it. Pinned and checked: a new version is a change here, its hash from the release's checksums.txt.
+      - name: Fetch lazygit
+        shell: bash
+        env:
+          LAZYGIT_VERSION: "0.66.2"
+          LAZYGIT_SHA256: "8b1e2194c2d8ac660f0a132cb4384e9d2fe1405217a144e280df16383c18d45c"
+        run: |
+          zip="lazygit_${LAZYGIT_VERSION}_windows_x86_64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$zip" "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/$zip"
+          echo "$LAZYGIT_SHA256  $RUNNER_TEMP/$zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/lazygit" app/src-tauri/binaries
+          unzip -o "$RUNNER_TEMP/$zip" lazygit.exe LICENSE -d "$RUNNER_TEMP/lazygit"
+          cp "$RUNNER_TEMP/lazygit/lazygit.exe" app/src-tauri/binaries/lazygit.exe
+          cp "$RUNNER_TEMP/lazygit/LICENSE" app/src-tauri/binaries/lazygit-LICENSE.txt
+          app/src-tauri/binaries/lazygit.exe --version
+      # The agents' terminals run on Microsoft's own ConPTY (conpty.dll + OpenConsole.exe, MIT, from microsoft/terminal),
+      # beside marv-desktop.exe, where portable-pty loads it before Windows' inbox one: Windows 10's inbox ConPTY didn't
+      # pass the mouse wheel to a full-screen agent (no scrolling up in Claude Code or Marv). Pinned and checked: a new
+      # version is a change here, its hash from the downloaded .nupkg (both files Authenticode-signed by Microsoft).
+      - name: Fetch ConPTY
+        shell: bash
+        env:
+          CONPTY_VERSION: "1.25.260930003"
+          CONPTY_SHA256: "02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee"
+        run: |
+          pkg="$RUNNER_TEMP/conpty.nupkg"
+          curl -fsSL -o "$pkg" "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/${CONPTY_VERSION}/microsoft.windows.console.conpty.${CONPTY_VERSION}.nupkg"
+          echo "$CONPTY_SHA256  $pkg" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/conpty" app/src-tauri/binaries
+          unzip -o "$pkg" runtimes/win-x64/native/conpty.dll build/native/runtimes/x64/OpenConsole.exe -d "$RUNNER_TEMP/conpty"
+          cp "$RUNNER_TEMP/conpty/runtimes/win-x64/native/conpty.dll" app/src-tauri/binaries/conpty.dll
+          cp "$RUNNER_TEMP/conpty/build/native/runtimes/x64/OpenConsole.exe" app/src-tauri/binaries/OpenConsole.exe
+      - name: Build the desktop (NSIS installer)
+        working-directory: app
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri build --bundles nsis --config "{\"version\":\"$VERSION\"}"
+      - name: Smoke test
+        shell: pwsh
+        run: packaging/desktop/smoke-windows.ps1 target/release/marv-desktop.exe
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="Marv_${VERSION}_x64-setup.exe"
+          mkdir -p dist
+          cp target/release/bundle/nsis/*-setup.exe "dist/$asset"
+          (cd dist && sha256sum "$asset" >"$asset.sha256" && cat "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marv-os-windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7

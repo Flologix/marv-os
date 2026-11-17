@@ -1,0 +1,30 @@
+# CI: format, clippy, tests and the desktop page, on every pull request and push to main. No secrets: nothing here
+# calls a real model. The sandbox guards must run, not skip: .github/actions/hosted-linux installs bubblewrap, allows
+# user namespaces and sets MARV_REQUIRE_SANDBOX=1. kernel-release.yml waits for this workflow's run on main.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to a pull request replaces its run; every commit on main runs to the end, since a release is gated on
+# its commit's CI and a cancelled run leaves that commit without a result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hosted runner setup
+        uses: ./.github/actions/hosted-linux
+      - name: All checks
+        run: MARV_ORACLE_BIN="$PWD/target/debug/marv" scripts/marv-os-check.sh

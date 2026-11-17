@@ -1,0 +1,21 @@
+[package]
+name = "marv-sandbox"
+description = "bubblewrap sandbox, protected paths and taint."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+marv-core.workspace = true
+marv-appcontainer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex = "1.11"
+nix = { version = "0.31.3", features = ["event", "fs", "process", "signal", "user"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

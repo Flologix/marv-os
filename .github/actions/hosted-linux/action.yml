@@ -1,0 +1,62 @@
+# Prepares a GitHub-hosted ubuntu-24.04 runner for the Marv OS checks and release build: toolchains, bubblewrap with
+# user namespaces allowed, WebKitGTK for the desktop, xvfb for its launch test, and basedpyright for the pyright guard.
+# Used by ci.yml and kernel-release.yml.
+name: Hosted Linux setup
+description: Prepare a GitHub-hosted Ubuntu runner for the Marv OS checks and release build
+
+runs:
+  using: composite
+  steps:
+    # Toolchains the image ships that Marv never uses: several GB back (setup-node fetches its Node again).
+    - name: Free disk space
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache \
+          /usr/share/swift /usr/local/share/powershell /usr/local/share/boost /usr/local/share/chromium \
+          /usr/share/miniconda /usr/lib/jvm /usr/local/julia* /usr/local/aws-cli /usr/local/lib/heroku
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /
+    # The workspace, its tests and the desktop outgrow the runner's disk with debug info (public ci.yml). The sandbox
+    # guards must run, not skip: MARV_REQUIRE_SANDBOX=1 fails the guard that checks they did.
+    - name: Build settings
+      shell: bash
+      run: |
+        {
+          echo CARGO_PROFILE_DEV_DEBUG=0
+          echo CARGO_PROFILE_TEST_DEBUG=0
+          echo CARGO_INCREMENTAL=0
+          echo CARGO_PROFILE_DEV_STRIP=debuginfo
+          echo CARGO_PROFILE_TEST_STRIP=debuginfo
+          echo MARV_REQUIRE_SANDBOX=1
+        } >>"$GITHUB_ENV"
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: kernel
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: app/package-lock.json
+    # Ubuntu 24.04's AppArmor rule stops unprivileged user namespaces, which bwrap needs.
+    - name: Install bubblewrap, WebKitGTK and xvfb
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bubblewrap libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+          librsvg2-dev xvfb
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    # Fail here, with bwrap's own error, rather than let the sandbox tests skip.
+    - name: Require a working sandbox
+      shell: bash
+      run: bwrap --ro-bind / / --unshare-net --unshare-pid -- true
+    # Outside the home and /tmp, which the sandbox hides, with the system Python, so the check can run it.
+    - name: Install basedpyright for the pyright guard
+      shell: bash
+      run: |
+        sudo /usr/bin/python3 -m venv /opt/basedpyright
+        sudo /opt/basedpyright/bin/pip install --quiet basedpyright
+        sudo ln -sf /opt/basedpyright/bin/basedpyright /usr/local/bin/basedpyright
+        basedpyright --version

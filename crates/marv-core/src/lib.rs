@@ -1,0 +1,722 @@
+//! Shared types for every Marv crate: the conversation the model sees, tool calls,
+//! the events a provider streams, and token usage. No I/O lives here.
+//!
+//! Ported from `src/provider/types.ts` and `src/types.ts` in Marv (TypeScript).
+//!
+//! **Prompt-cache rule (applies to every crate):** the conversation is append-only.
+//! Every request must start with the exact bytes of the previous one, so a
+//! [`ToolCall::arguments`] is kept as the raw JSON text the model produced and
+//! never re-serialized. Compaction is the only deliberate exception.
+
+use serde::{Deserialize, Serialize};
+
+pub mod command;
+pub mod home;
+pub mod image;
+pub mod printable;
+pub mod process;
+pub use printable::printable;
+
+/// A tool the model asked Marv to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Pairs the call with its result in the next request. De-duplicated by the
+    /// agent loop (Ollama reuses `call_0`).
+    pub id: String,
+    pub name: String,
+    /// The arguments as the raw JSON text the model produced. Kept verbatim so
+    /// every later request re-sends exactly the same bytes (prompt cache).
+    pub arguments: String,
+}
+
+/// Provider-specific reasoning kept on an assistant turn so it can be sent back
+/// on later steps (OpenRouter `reasoning_details`, Anthropic thinking blocks).
+/// Opaque: stored and re-sent byte for byte. (Marv issue #57.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reasoning(pub serde_json::Value);
+
+/// One entry of the conversation the model sees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum ChatTurn {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "toolCalls")]
+        tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<Reasoning>,
+    },
+    Tool {
+        #[serde(rename = "callId")]
+        call_id: String,
+        name: String,
+        text: String,
+    },
+    /// marv-rs: images the turn before brought (the person's message, or the step's tool results), shown to the model
+    /// ([`image`]). Providers fold it into the message format they speak.
+    Images {
+        images: Vec<image::Image>,
+    },
+}
+
+/// How a tool is described to the model: what it does and the JSON schema of its input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Token counts and cost for one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Tokens in the prompt we sent (system + tools + conversation).
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Prompt tokens served from the provider's cache, when reported.
+    pub cached_tokens: Option<u64>,
+    /// USD, when the provider reports it (OpenRouter does).
+    pub cost: Option<f64>,
+}
+
+impl Usage {
+    /// Adds another request's usage to a running total.
+    pub fn add(&mut self, other: &Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cached_tokens = match (self.cached_tokens, other.cached_tokens) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        self.cost = match (self.cost, other.cost) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        };
+    }
+}
+
+/// What a provider streams. The agent loop and the UI only ever see these, so
+/// swapping vendors never touches them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderEvent {
+    TextDelta(String),
+    /// The model's private reasoning (thinking models only).
+    ThinkingDelta(String),
+    /// A piece of a tool call as it streams, for display only (a long write_file
+    /// being written). The call itself still arrives whole as [`ProviderEvent::ToolCall`].
+    ToolCallDelta {
+        index: usize,
+        name: String,
+        text: String,
+    },
+    ToolCall(ToolCall),
+    /// Opaque reasoning payload to keep on the assistant turn.
+    Reasoning(Reasoning),
+    /// One request's usage and how it ended (#90): the vendor's finish reason ("stop",
+    /// "tool_calls", "length"…), and, when debug recording was on, the raw response.
+    Usage(Usage, ReplyEnd),
+    /// `reason` is the vendor's stop reason: "stop", "tool_calls", "length"…
+    Done {
+        reason: Option<String>,
+    },
+    Error(String),
+    /// The provider is retrying after a dropped connection. `continued`: the partial
+    /// reply was kept and the next attempt continues it, instead of starting over (Marv #64).
+    /// `cause`: why (trajectories count stalls and degenerate replies, Marv #88, #96).
+    Retry {
+        attempt: u32,
+        max: u32,
+        message: String,
+        continued: bool,
+        cause: RetryCause,
+    },
+    /// Throw away everything this reply has streamed so far (text, reasoning, calls), with no new attempt after it:
+    /// an `Error` follows. Marv #96: the second degenerate reply, which must not end up in the history.
+    Discard {
+        cause: RetryCause,
+    },
+}
+
+/// Why a provider retries a request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The connection dropped or failed, the server answered a temporary error, or the stream broke off.
+    #[default]
+    Dropped,
+    /// Marv #88: the stream went silent (no bytes at all) for longer than the idle timeout.
+    Stalled,
+    /// Marv #96: the reply degenerated (whitespace, or one short piece over and over) and was thrown away;
+    /// `discarded` is how many bytes of text and reasoning that attempt had streamed.
+    Degenerate { discarded: u64 },
+    /// marv-rs (runtime-kernel §20.9): the provider answered 429, too many requests: the agent is "running hot".
+    Throttled,
+}
+
+/// Whether the model may call tools on a request. `None` is used for the
+/// wrap-up reply at the step limit; tools are still sent so the cache holds (Marv #59).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+}
+
+/// Why a run of the agent loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    End,
+    Length,
+    Aborted,
+    Declined,
+    MaxSteps,
+    Error,
+    Loop,
+    /// marv-rs: the run's deadline (`marv -p --time-limit`) came before it finished.
+    TimeLimit,
+}
+
+/// How much a tool hands back to the loop.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolResult {
+    /// What the model reads.
+    pub output: String,
+    /// One line for the transcript ("42 lines", "exit 0").
+    pub summary: Option<String>,
+    pub is_error: bool,
+    /// marv-rs: images for the model to look at (`read_file` on a screenshot), after the step's results.
+    pub images: Vec<image::Image>,
+}
+
+/// How a request ended (#90), sent with the usage on [`ProviderEvent::Usage`]: the vendor's
+/// finish reason always (a reply that "finished" while Marv parsed no tool call out of it is
+/// what a diagnostic looks for), and the raw response only when the provider was asked to
+/// collect it (`StreamOptions::debug_raw`, `MARV_DEBUG_RAW`): the last attempt's payloads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplyEnd {
+    pub finish_reason: Option<String>,
+    /// The raw response payloads (debug recording only; the prompt cache and the loop never read it).
+    pub raw_response: Option<String>,
+    /// Runtime-kernel §16.5: the plan's quota, when the response's headers told it.
+    pub quota: Option<Quota>,
+    /// marv-rs (runtime-kernel §20.9): the provider's rate limit, from the response's headers when it sent them.
+    pub rate_limit: Option<RateLimit>,
+}
+
+/// A provider's rate limit and what's left of it (`x-ratelimit-*`, `anthropic-ratelimit-*`), per its window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateLimit {
+    pub requests_limit: Option<u64>,
+    pub requests_left: Option<u64>,
+    pub tokens_limit: Option<u64>,
+    pub tokens_left: Option<u64>,
+}
+
+impl RateLimit {
+    /// From response headers (name, value), names in any case. `None` when none of them is there.
+    pub fn from_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<Self> {
+        let mut limit = Self::default();
+        let mut any = false;
+        for (name, value) in headers {
+            let name = name.to_ascii_lowercase();
+            let Ok(number) = value.trim().parse::<u64>() else { continue };
+            let slot = match name.as_str() {
+                "x-ratelimit-limit-requests" | "x-ratelimit-limit" | "anthropic-ratelimit-requests-limit" => {
+                    &mut limit.requests_limit
+                }
+                "x-ratelimit-remaining-requests" | "x-ratelimit-remaining" | "anthropic-ratelimit-requests-remaining" => {
+                    &mut limit.requests_left
+                }
+                "x-ratelimit-limit-tokens" | "anthropic-ratelimit-tokens-limit" => &mut limit.tokens_limit,
+                "x-ratelimit-remaining-tokens" | "anthropic-ratelimit-tokens-remaining" => &mut limit.tokens_left,
+                _ => continue,
+            };
+            *slot = Some(number);
+            any = true;
+        }
+        any.then_some(limit)
+    }
+}
+
+impl ReplyEnd {
+    /// The end every non-debug caller records: just the vendor's finish reason.
+    pub fn reason(reason: Option<String>) -> Self {
+        Self { finish_reason: reason, ..Self::default() }
+    }
+}
+
+/// A plan's quota as its provider's headers told it (runtime-kernel §16.5): numbers only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quota {
+    /// Requests (or tokens) left in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u64>,
+    /// How much of the window is used, in percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u32>,
+    /// When the window resets (ms since the Unix epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_ms: Option<u64>,
+}
+
+/// How much a tool call can do, which decides approval, yolo and parallelism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    /// Reads only. May run in parallel with other reads (Marv #58).
+    Read,
+    /// Changes files in the project.
+    Write,
+    /// Runs something (bash, MCP, a subagent).
+    Execute,
+    /// Reaches the network or leaves the sandbox: always asks once the session is tainted.
+    Egress,
+}
+
+/// The narrow, named ways out of the sandbox (Marv Sprint 4), each with its own rule for what it can never do:
+/// `Host` is bash with `sandbox: false` (one command on the user's machine, Marv #52); `Github` runs gh with the
+/// user's login (#47); `Process` keeps a server running in its own sandbox (#51); `Herdr` drives the Herdr terminal
+/// multiplexer Marv runs in from Marv's own process (#74). A call through one carries it on its approval (the prompt
+/// shows the door's warning line) and on its result (trajectories name it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Door {
+    Github,
+    Process,
+    Host,
+    Herdr,
+}
+
+/// Where a piece of text came from. Text from anything but the user or Marv
+/// itself is data, never instructions (see `docs/SECURITY.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    User,
+    Marv,
+    Project,
+    Web,
+    Mcp,
+    Mesh,
+    Subagent,
+    Image,
+    /// A session-start hook's output (#108): the user chose the command, not what it prints (`bd ready` lists issue
+    /// titles anyone can file). A hook marked `trusted` in the user's config doesn't taint.
+    Hook,
+    /// What the Herdr door read back (#74): other panes' screens, names and titles, which another agent or program
+    /// wrote. Fenced as data and tainting, like a mesh message.
+    Herdr,
+    /// What the GitHub door returned: issues, pull requests, comments, logs and API answers, which other people wrote.
+    Github,
+    /// The output of a command that ran with the network (bash with `network: true` or on the host, a background
+    /// process started with the network): it can print whatever a server sent it.
+    Network,
+}
+
+/// The three kinds of source a piece of text in a model's context can have (`docs/SECURITY.md`, "Provenance and
+/// taint"). Ordered from most to least trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceClass {
+    /// The person (what they type and answer, their own files and config) and Marv's fixed words: not fenced.
+    Authority,
+    /// The project folder the person chose to work in (files, local git history, checks, the formatter) and a
+    /// subagent's report: quoted where Marv speaks about it, never tainting.
+    Workspace,
+    /// Anything someone other than the person could have written over a network or from another agent: fenced as
+    /// data, and it taints the conversation.
+    Outside,
+}
+
+impl Provenance {
+    /// The class of source this is ([`SourceClass`]).
+    pub fn class(self) -> SourceClass {
+        match self {
+            Self::User | Self::Marv => SourceClass::Authority,
+            Self::Project | Self::Subagent => SourceClass::Workspace,
+            Self::Web | Self::Mcp | Self::Mesh | Self::Image | Self::Hook | Self::Herdr | Self::Github | Self::Network => {
+                SourceClass::Outside
+            }
+        }
+    }
+
+    /// Whether text from this source taints the session (exfiltration-capable
+    /// calls ask from then on, even in yolo): an [`SourceClass::Outside`] source.
+    pub fn taints(self) -> bool {
+        self.class() == SourceClass::Outside
+    }
+
+    /// The less trusted of the two (by [`SourceClass`]; `self` when they're the same class).
+    pub fn least_trusted(self, other: Provenance) -> Provenance {
+        if other.class() > self.class() { other } else { self }
+    }
+}
+
+/// The most characters a reason for declining a call keeps (#185). The engine cuts there (marv-tools'
+/// `declined_because`, the web approver); the TUI's input stops there.
+pub const MAX_DECLINE_REASON: usize = 500;
+
+/// Said after a change that's saved but not used by the conversation that's running: memory, instructions, skills,
+/// agent types, MCP servers. The system prompt and the tool list are fixed for a conversation's life (the cached
+/// prefix), so the change is read when the next one starts: a new conversation, `/clear`, or a resume.
+pub const APPLIES_AT_NEXT_START: &str = "Applies to new conversations and after /clear: this one keeps what it started with.";
+
+/// A reason's characters on one line (#185): newlines, tabs and other whitespace as spaces, control characters
+/// dropped. The TUI's input and the engine read a reason the same way.
+pub fn reason_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !c.is_control())
+}
+
+/// A reason for declining a call as the model reads it: [`reason_chars`], trimmed, at most [`MAX_DECLINE_REASON`].
+pub fn decline_reason(text: &str) -> String {
+    let flat: String = reason_chars(text).collect();
+    flat.trim().chars().take(MAX_DECLINE_REASON).collect()
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MarvError {
+    #[error("{0}")]
+    Tool(String),
+    #[error("provider: {0}")]
+    Provider(String),
+    #[error("aborted")]
+    Aborted,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+pub type Result<T, E = MarvError> = std::result::Result<T, E>;
+
+/// The tag that fences text quoted as data for a model (`<untrusted-data source=… from=…>`). `marv_session::provenance`
+/// builds it for tool results; MCP tool descriptions in Marv's notes use it too ([`untrusted_block`]).
+pub const UNTRUSTED_TAG: &str = "untrusted-data";
+
+/// What a configured secret is replaced with in a tool result ([`Secrets::redact`]).
+pub const REDACTED_SECRET: &str = "[redacted: a secret from Marv's configuration]";
+
+/// A configured secret shorter than this isn't redacted: replacing every `abc` in every output would mangle it, and a
+/// key that short protects nothing anyway.
+pub const MIN_SECRET_CHARS: usize = 8;
+
+/// The secrets Marv itself was configured with (the provider API keys, a custom provider's key, MCP servers' tokens),
+/// which no tool result may carry to the model, the stream or a trajectory (docs/SECURITY.md, "Marv's own secrets
+/// never come back in a tool result"). marv-rs only: a model in a container `cat`ed Marv's config.json and the
+/// OpenRouter key went to the model and into the run's logs (Terminal-Bench, 2026-11-06). `Debug` shows only how
+/// many there are.
+#[derive(Clone, Default)]
+pub struct Secrets {
+    /// Longest first, so one secret that holds another is replaced whole.
+    values: Vec<String>,
+}
+
+impl Secrets {
+    /// The non-empty values (trimmed) of at least [`MIN_SECRET_CHARS`] characters, each once.
+    pub fn new(values: impl IntoIterator<Item = String>) -> Self {
+        let mut values: Vec<String> =
+            values.into_iter().map(|v| v.trim().to_string()).filter(|v| v.chars().count() >= MIN_SECRET_CHARS).collect();
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        values.dedup();
+        Self { values }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// `text` with every secret replaced by [`REDACTED_SECRET`]; `None` when it holds none (nothing to change).
+    pub fn redact(&self, text: &str) -> Option<String> {
+        let mut out: Option<String> = None;
+        for secret in &self.values {
+            let current = out.as_deref().unwrap_or(text);
+            if current.contains(secret.as_str()) {
+                out = Some(current.replace(secret.as_str(), REDACTED_SECRET));
+            }
+        }
+        out
+    }
+
+    /// [`Self::redact`], in place.
+    pub fn redact_in(&self, text: &mut String) {
+        if let Some(redacted) = self.redact(text) {
+            *text = redacted;
+        }
+    }
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets").field("count", &self.values.len()).finish()
+    }
+}
+
+/// At most this many characters of a fence's `from` (a call's label: often the whole command) are kept, then `…`.
+/// marv-rs (2026-11-06): repeating long commands there was 17% of a Terminal-Bench run's tool-output characters.
+pub const MAX_FROM_CHARS: usize = 100;
+
+/// `text` fenced as data: `<untrusted-data source="<source>" from="<from>">`, the text, the closing tag. The text
+/// can't close the fence (its closing tags are defused, [`defuse_closing_tag`]) and `source` and `from` can't end
+/// their attribute or the tag ([`escape_attribute`]). `from` is cut to [`MAX_FROM_CHARS`] (the same cut every time,
+/// so the bytes are stable for the prompt cache).
+pub fn untrusted_block(source: &str, from: &str, text: &str) -> String {
+    let from = match from.char_indices().nth(MAX_FROM_CHARS) {
+        Some((end, _)) => format!("{}…", &from[..end]),
+        None => from.to_string(),
+    };
+    let (source, from) = (escape_attribute(source), escape_attribute(&from));
+    let body = defuse_closing_tag(text, UNTRUSTED_TAG);
+    format!("<{UNTRUSTED_TAG} source=\"{source}\" from=\"{from}\">\n{body}\n</{UNTRUSTED_TAG}>")
+}
+
+/// `value` as it can sit inside a double-quoted attribute: `&`, `"`, `<` and `>` as entities, and line breaks and
+/// other control characters as spaces, so a fence's opening tag stays one line that `value` can't close.
+pub fn escape_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' | '\u{FF02}' => out.push_str("&quot;"),
+            '<' | '\u{FF1C}' => out.push_str("&lt;"),
+            '>' | '\u{FF1E}' => out.push_str("&gt;"),
+            // Line and paragraph separators break a line too; invisible characters hide what's there.
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}') || invisible(c) => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `text` with every closing tag for `tag` turned into `<\/…`, so text quoted inside a `<tag>` fence can't close it.
+/// `tag` is ASCII. A closing tag is matched the way a reader would see one: in any case, with whitespace (any
+/// Unicode whitespace) and invisible characters (zero-width spaces and joiners, the soft hyphen, bidi controls,
+/// variation selectors: [`invisible`]) anywhere in it ignored, and with the fullwidth and small forms of `<`, `/` and
+/// the ASCII letters (`＜／ＵＮＴＲＵＳＴＥＤ`) read as theirs.
+pub fn defuse_closing_tag(text: &str, tag: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((i, open)) =
+        rest.char_indices().find(|(_, c)| matches!(c, '<' | '\u{FF1C}' | '\u{FE64}' | '\u{2039}' | '\u{3008}' | '\u{276E}'))
+    {
+        let after_open = &rest[i + open.len_utf8()..];
+        let slash_end = after_open
+            .char_indices()
+            .find(|(_, c)| !ignorable(*c))
+            .filter(|(_, c)| matches!(c, '/' | '\u{FF0F}' | '\u{2215}' | '\u{2044}' | '\u{29F8}'))
+            .map(|(j, c)| j + c.len_utf8());
+        out.push_str(&rest[..i]);
+        match slash_end {
+            Some(end) if names(&after_open[end..], tag) => {
+                out.push_str("<\\/");
+                rest = &after_open[end..];
+            }
+            _ => {
+                out.push(open);
+                rest = after_open;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `text` starts with `tag` as a reader would see it (see [`defuse_closing_tag`]).
+fn names(text: &str, tag: &str) -> bool {
+    let mut chars = text.chars().filter(|c| !ignorable(*c)).map(fold);
+    tag.chars().all(|want| chars.next() == Some(want.to_ascii_lowercase()))
+}
+
+/// A character a reader doesn't see between two others: whitespace, [`invisible`], or a combining mark (it sits on the
+/// letter before it: `u\u{0301}` reads as a `u`).
+fn ignorable(c: char) -> bool {
+    c.is_whitespace()
+        || invisible(c)
+        || matches!(c as u32, 0x0300..=0x036F | 0x0483..=0x0489 | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
+}
+
+/// Format and other invisible characters: the soft hyphen, the combining grapheme joiner, Arabic and Mongolian marks,
+/// the Hangul fillers, zero-width spaces and joiners, bidi controls, invisible operators, variation selectors, the
+/// byte-order mark, shorthand format controls and tag characters.
+pub fn invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x200B..=0x200F
+        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+}
+
+/// A character as it reads (the letters' compatibility forms, as NFKC folds them): fullwidth ASCII, the mathematical
+/// alphanumeric letters (bold, italic, script, fraktur, double-struck, sans-serif, monospace), circled and
+/// parenthesized letters as ASCII letters, dashes and minus signs as `-`, lowercased.
+fn fold(c: char) -> char {
+    let n = c as u32;
+    let letter = |offset: u32| char::from_u32(if offset < 26 { 'a' as u32 + offset } else { 'a' as u32 + offset - 26 });
+    let c = match n {
+        0xFF01..=0xFF5E => char::from_u32(n - 0xFEE0),
+        0x1D400..=0x1D6A3 => letter((n - 0x1D400) % 52),
+        0x24B6..=0x24CF => letter(n - 0x24B6),
+        0x24D0..=0x24E9 => letter(n - 0x24D0),
+        0x249C..=0x24B5 => letter(n - 0x249C),
+        0x2010..=0x2015 | 0x2212 | 0xFE58 | 0xFE63 | 0x207B | 0x208B => Some('-'),
+        _ => None,
+    }
+    .unwrap_or(c);
+    c.to_ascii_lowercase()
+}
+
+/// Characters a token, for estimates before a provider counts (Marv's `estimateTokens`).
+pub const CHARS_PER_TOKEN: u64 = 4;
+
+/// Marv #63: the one token estimate, about four characters a token, rounded up. Counts `char`s (Marv counted UTF-16
+/// units; the TUI's thinking counter still does, to match Marv's display). Used for budgets before a request is sent
+/// (compaction's tail and overflow recovery) and for counts still streaming.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(CHARS_PER_TOKEN)
+}
+
+/// [`estimate_tokens`] for one history entry: its text, plus each tool call's name and arguments.
+pub fn estimate_turn_tokens(turn: &ChatTurn) -> u64 {
+    match turn {
+        ChatTurn::User { text } => estimate_tokens(text),
+        ChatTurn::Assistant { text, tool_calls, .. } => {
+            estimate_tokens(text)
+                + tool_calls.iter().map(|c| estimate_tokens(&c.name) + estimate_tokens(&c.arguments)).sum::<u64>()
+        }
+        ChatTurn::Tool { name, text, .. } => estimate_tokens(name) + estimate_tokens(text),
+        ChatTurn::Images { images } => images.len() as u64 * image::IMAGE_TOKENS,
+    }
+}
+
+/// [`estimate_turn_tokens`] summed over a history.
+pub fn estimate_history_tokens(history: &[ChatTurn]) -> u64 {
+    history.iter().map(estimate_turn_tokens).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REDACTED_SECRET, Secrets};
+
+    #[test]
+    fn configured_secrets_are_redacted_whole_and_debug_hides_them() {
+        let key = "sk-or-v1-fake0000000000000000";
+        let secrets = Secrets::new([key.to_string(), format!("{key}-longer"), " short ".into(), String::new(), key.into()]);
+        assert_eq!(
+            secrets.redact(&format!("{{\"apiKey\": \"{key}\"}} and {key}-longer")).as_deref(),
+            Some(format!("{{\"apiKey\": \"{REDACTED_SECRET}\"}} and {REDACTED_SECRET}").as_str())
+        );
+        assert_eq!(secrets.redact("nothing here, short"), None);
+        let mut text = format!("x{key}y");
+        secrets.redact_in(&mut text);
+        assert_eq!(text, format!("x{REDACTED_SECRET}y"));
+        assert_eq!(format!("{secrets:?}"), "Secrets { count: 2 }");
+        assert!(Secrets::default().is_empty() && Secrets::new(["tiny".to_string()]).is_empty());
+    }
+
+    /// A long `from` (a whole command) is cut to `MAX_FROM_CHARS` characters and `…`, the same way every time; a short
+    /// one is kept whole; a cut never splits a character, and the cut text is still escaped.
+    #[test]
+    fn a_fences_from_is_cut_to_a_hundred_characters() {
+        let long = format!("cat <<'EOF' > x.py \"{}\"", "é".repeat(300));
+        let block = super::untrusted_block("network", &long, "out");
+        let from = block.split("from=\"").nth(1).unwrap().split("\">").next().unwrap();
+        assert!(from.ends_with('…'), "{from}");
+        assert!(from.starts_with("cat &lt;&lt;'EOF' &gt; x.py &quot;é"), "{from}");
+        assert_eq!(from.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").chars().count(), 101);
+        assert_eq!(block, super::untrusted_block("network", &long, "out"));
+        let short = super::untrusted_block("web", "https://example.com/a", "x");
+        assert!(short.starts_with("<untrusted-data source=\"web\" from=\"https://example.com/a\">\n"));
+        let exact = "a".repeat(super::MAX_FROM_CHARS);
+        assert!(super::untrusted_block("web", &exact, "x").contains(&format!("from=\"{exact}\">")));
+    }
+
+    /// Runtime-kernel §20.9: the rate-limit headers OpenAI, OpenRouter and Anthropic send; none, or junk, is none.
+    #[test]
+    fn rate_limit_headers() {
+        let openai = [("X-RateLimit-Limit-Requests", "500"), ("x-ratelimit-remaining-requests", "499"), ("other", "1")];
+        let got = super::RateLimit::from_headers(openai).unwrap();
+        assert_eq!((got.requests_limit, got.requests_left, got.tokens_limit), (Some(500), Some(499), None));
+        let anthropic = [("anthropic-ratelimit-tokens-limit", "80000"), ("anthropic-ratelimit-tokens-remaining", "1000")];
+        assert_eq!(super::RateLimit::from_headers(anthropic).unwrap().tokens_left, Some(1000));
+        assert_eq!(super::RateLimit::from_headers([("x-ratelimit-limit", "soon")]), None);
+        assert_eq!(super::RateLimit::from_headers([("content-type", "text/event-stream")]), None);
+    }
+
+    #[test]
+    fn estimate_tokens_is_four_chars_a_token_rounded_up() {
+        assert_eq!(super::estimate_tokens(""), 0);
+        assert_eq!(super::estimate_tokens("abc"), 1);
+        assert_eq!(super::estimate_tokens(&"x".repeat(4800)), 1200);
+        let call = super::ToolCall { id: "c".into(), name: "read".into(), arguments: "12345678".into() };
+        let turn = super::ChatTurn::Assistant { text: "abcd".into(), tool_calls: vec![call], reasoning: None };
+        assert_eq!(super::estimate_turn_tokens(&turn), 1 + 1 + 2);
+    }
+
+    #[test]
+    fn a_decline_reason_is_one_trimmed_line_without_controls_and_cut() {
+        assert_eq!(super::decline_reason("  use pnpm\n\tnot bun\x1b[2J \r\n"), "use pnpm  not bun[2J");
+        assert_eq!(super::decline_reason(&"é".repeat(super::MAX_DECLINE_REASON + 5)).chars().count(), super::MAX_DECLINE_REASON);
+    }
+
+    use super::*;
+
+    #[test]
+    fn closing_tags_are_defused_in_any_case() {
+        let tag = "untrusted-data";
+        assert_eq!(defuse_closing_tag("a</untrusted-data>b", tag), "a<\\/untrusted-data>b");
+        assert_eq!(defuse_closing_tag("</UNTRUSTED-DATA></Untrusted-Data >", tag), "<\\/UNTRUSTED-DATA><\\/Untrusted-Data >");
+        assert_eq!(defuse_closing_tag("</ untrusted-data>", tag), "<\\/ untrusted-data>");
+        assert_eq!(defuse_closing_tag("</b> </untrusted <é </", tag), "</b> </untrusted <é </");
+        assert_eq!(defuse_closing_tag("</untrusted-datä", tag), "</untrusted-datä");
+    }
+
+    #[test]
+    fn closing_tags_hidden_with_invisible_or_fullwidth_characters_are_defused() {
+        let tag = "untrusted-data";
+        for hostile in [
+            "<\u{200B}/untrusted-data>",
+            "</un\u{200D}trusted\u{00AD}-data>",
+            "</u\u{0301}ntrusted-data>",
+            "</𝐮𝐧𝐭𝐫𝐮𝐬𝐭𝐞𝐝-𝐝𝐚𝐭𝐚>",
+            "</ⓤⓝⓣⓡⓤⓢⓣⓔⓓ-ⓓⓐⓣⓐ>",
+            "\u{2039}/untrusted-data>",
+            "<\u{E0100}/untrusted-data>",
+            "</\u{FEFF}untrusted-data>",
+            "\u{FF1C}\u{FF0F}untrusted-data>",
+            "</ＵＮＴＲＵＳＴＥＤ－ＤＡＴＡ>",
+            "<\u{3000}/untrusted\u{2011}data>",
+            "</untrusted-\u{202E}data>",
+        ] {
+            let out = defuse_closing_tag(hostile, tag);
+            assert!(out.starts_with("<\\/"), "{hostile:?} → {out:?}");
+        }
+        assert_eq!(defuse_closing_tag("a < b and a </ b>", tag), "a < b and a </ b>");
+        assert_eq!(defuse_closing_tag("＜not a tag", tag), "＜not a tag");
+    }
+
+    #[test]
+    fn chat_turn_round_trips_with_marv_ts_field_names() {
+        let turn = ChatTurn::Assistant {
+            text: "hi".into(),
+            tool_calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(), arguments: "{\"path\":\"a\"}".into() }],
+            reasoning: None,
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        assert_eq!(
+            json,
+            r#"{"role":"assistant","text":"hi","toolCalls":[{"id":"c1","name":"read_file","arguments":"{\"path\":\"a\"}"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<ChatTurn>(&json).unwrap(), turn);
+    }
+
+    #[test]
+    fn usage_adds_optional_fields() {
+        let mut total = Usage::default();
+        total.add(&Usage { prompt_tokens: 10, completion_tokens: 2, cached_tokens: Some(8), cost: None });
+        total.add(&Usage { prompt_tokens: 5, completion_tokens: 1, cached_tokens: None, cost: Some(0.01) });
+        assert_eq!(total.prompt_tokens, 15);
+        assert_eq!(total.cached_tokens, Some(8));
+        assert_eq!(total.cost, Some(0.01));
+    }
+}

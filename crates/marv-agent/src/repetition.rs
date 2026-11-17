@@ -1,0 +1,959 @@
+//! Repetition detection: catch a model stuck in a loop repeating text or tool calls. Ports
+//! `src/repetition.ts` (Marv #42).
+//!
+//! - **Text:** the same sentence (trimmed, lowercased) [`TEXT_REPEATS`] (8)+ times in a row,
+//!   across the last ~4 KB of the reply ([`TEXT_WINDOW`]), so a burst near the end is caught early
+//!   and earlier text doesn't keep a busy reply from ever triggering. Sentences split on `. ! ?`
+//!   followed by whitespace or the end, and on newlines. Only "sentence-like" units count (≥ 20
+//!   characters, ≥ 2 words), so code fragments and list markers ("- milk") never trigger.
+//! - **Tool calls:** a period-1 (A,A,A) or period-2 (A,B,A,B,A) cycle across steps, from a short
+//!   history ([`TOOL_HISTORY`] = 8 steps). A step with a write-like tool (`edit_file`,
+//!   `write_file`, `bash`) resets it: a re-read after a change is legitimate. Only steps with the
+//!   same number of calls compare. The agent loop folds each call's *last result* into its key,
+//!   so the same call returning something new each time (the next item of a queue) is new work.
+//! - Arguments are normalized with keys sorted **at every depth**: Marv once filtered nested
+//!   objects with a key list, so `{"filter":{"id":1}}` and `{"filter":{"id":2}}` compared equal.
+//! - **Failing commands** (marv-rs, #81): bash resets the tool-call history above, and a model retrying a command
+//!   that can't succeed varies its tail (`&& du -sh`, `|| true`, `| tail -2`), so neither guard saw a `git clone`
+//!   re-sent 11 times. [`FailureLoopState`] remembers each bash command by [`marv_core::command::command_key`] (plus
+//!   its `network`/`sandbox: false` flags) with its failure's signature ([`failure_signature`]: its first error-like
+//!   line). Once a command failed the same way [`FAILURE_REPEATS`] (2) times in a row with no call since that may
+//!   have changed things (any tool but bash and the [`READ_ONLY_TOOLS`]), another try is a loop. Low on false positives: a different error, a success, or a file
+//!   edit resets it (a model re-running tests after an edit is never caught), and other commands in between (probes
+//!   like `echo test`) neither count nor reset.
+//!
+//! - **Escalation** (marv-rs, Terminal-Bench 0.15.0; Marv warns once, then ends the run): a detected loop goes
+//!   [`LoopVerdict::Warn`], then [`LoopVerdict::FinalChance`] (one more turn to save the work), then
+//!   [`LoopVerdict::Stop`] ([`ToolLoopState::escalate`]). Marv's `warned` was never reset, so one early warning made
+//!   any later, unrelated loop end the run without a word; here [`TOOL_LOOP_PROGRESS`] distinct calls that ran and
+//!   succeeded since the warning reset it ([`ToolLoopState::progressed`]). The hard stop stays: at most
+//!   [`MAX_TOOL_LOOP_RESCUES`] final turns a run, and a loop right after one ends the run.
+//! - **Read-only loops don't end a run early** (marv-rs, Terminal-Bench 2026-11-06 `schemelike-metacircular-eval`:
+//!   a `read_file` re-sent without `offset` went warn, final turn, stop in three steps, 22 s into a 40-minute budget,
+//!   nothing written). Repeating a call that only reads ([`READ_ONLY_TOOLS`]) costs a step and harms nothing, so such a
+//!   loop is warned about up to [`MAX_READ_ONLY_LOOP_WARNINGS`] times in a row ([`ToolLoopState::escalate_read_only`])
+//!   before the escalation above applies; a loop with any other call (side effects) escalates as before.
+//! - **A truncated read repeated reads on** (marv-rs, same runs): [`ReadPages`] remembers, for each `read_file` call
+//!   (by its normalized arguments) whose last result was a page with more after it, the offset that page names
+//!   ([`next_page_offset`]: Marv's `Use offset=N to read more.`). The same call again, with nothing run in between
+//!   that may have changed the file, is run with that offset ([`with_offset`], for the runner only: the call in the
+//!   history stays as the model sent it) and its result says so ([`read_on_note`]). A call that may change things
+//!   (any tool not in [`READ_ONLY_TOOLS`], bash unless its command only reads) and a compaction forget the pages.
+//!
+//! Port note: Marv measures lengths in UTF-16 units; here the text thresholds count `char`s.
+
+use serde_json::Value;
+
+/// Consecutive identical sentences that make a text loop.
+pub const TEXT_REPEATS: usize = 8;
+/// How much of the reply's end is checked, in characters.
+pub const TEXT_WINDOW: usize = 4096;
+/// A unit shorter than this is never "sentence-like".
+pub const MIN_SENTENCE_CHARS: usize = 20;
+/// Steps of tool calls remembered.
+pub const TOOL_HISTORY: usize = 8;
+/// Tools whose use resets the tool-loop history.
+pub const WRITE_TOOLS: [&str; 3] = ["edit_file", "write_file", "bash"];
+
+/// Splits text into sentence-like units: on `. ! ?` followed by whitespace or the end, and on newlines.
+pub fn split_sentences(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        let next = chars.peek().map(|&(_, c)| c);
+        let ends = ch == '\n' || (matches!(ch, '.' | '!' | '?') && next.is_none_or(char::is_whitespace));
+        if ends {
+            let end = i + ch.len_utf8();
+            let unit = text[start..end].trim();
+            if !unit.is_empty() {
+                parts.push(unit.to_string());
+            }
+            start = end;
+        }
+    }
+    let rest = text[start..].trim();
+    if !rest.is_empty() {
+        parts.push(rest.to_string());
+    }
+    if parts.is_empty() {
+        // Marv's fallback (only reachable for whitespace-only text, which yields nothing either).
+        return text.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    }
+    parts
+}
+
+/// Whether the reply text so far shows degenerate repetition (see the module notes).
+pub fn detect_text_repetition(text: &str) -> bool {
+    let len = text.chars().count();
+    if len < MIN_SENTENCE_CHARS {
+        return false;
+    }
+    let tail = if len > TEXT_WINDOW {
+        let (at, _) = text.char_indices().nth(len - TEXT_WINDOW).expect("in range");
+        &text[at..]
+    } else {
+        text
+    };
+    let units: Vec<String> = split_sentences(tail).into_iter().map(|u| u.trim().to_lowercase()).collect();
+    if units.len() < TEXT_REPEATS {
+        return false;
+    }
+    let mut consecutive = 1;
+    for i in (0..units.len() - 1).rev() {
+        if units[i] == units[i + 1] && is_sentence_like(&units[i]) {
+            consecutive += 1;
+            if consecutive >= TEXT_REPEATS {
+                return true;
+            }
+        } else {
+            consecutive = 1;
+        }
+    }
+    false
+}
+
+/// At least 20 characters and at least 2 whitespace-separated words.
+fn is_sentence_like(unit: &str) -> bool {
+    unit.chars().count() >= MIN_SENTENCE_CHARS && unit.split_whitespace().count() >= 2
+}
+
+/// A normalized key for a tool call, compared across steps.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolCallKey {
+    pub name: String,
+    /// Arguments, parsed and re-printed with keys sorted at every depth; the raw text when not JSON.
+    pub args: String,
+}
+
+/// Distinct calls that ran and succeeded since a loop warning that count as progress: the warning (and a final
+/// turn) are forgotten, so a later, unrelated loop is warned about again rather than ending the run.
+pub const TOOL_LOOP_PROGRESS: usize = 5;
+/// Final turns a run may get after looping past a warning; past them the next loop past a warning ends the run.
+pub const MAX_TOOL_LOOP_RESCUES: u32 = 2;
+
+/// Warnings in a row a loop of read-only calls ([`READ_ONLY_TOOLS`]) gets before the final turn and the stop: such a
+/// loop costs a step each time and changes nothing, so it only ends a run that is truly stuck.
+pub const MAX_READ_ONLY_LOOP_WARNINGS: u32 = 5;
+
+/// What to do about a detected loop ([`ToolLoopState::escalate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopVerdict {
+    /// The first time: the calls aren't run, the model is told what it keeps sending.
+    Warn,
+    /// Again after the warning: not run, and the model gets one final turn to save its work and answer.
+    FinalChance,
+    /// Again after the final turn (or past [`MAX_TOOL_LOOP_RESCUES`]): the run ends.
+    Stop,
+}
+
+/// State kept across steps for tool-call loop detection.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolLoopState {
+    /// Recent steps' calls (at most [`TOOL_HISTORY`]).
+    pub history: Vec<Vec<ToolCallKey>>,
+    /// Whether the model was already warned about a loop (since its last progress).
+    pub warned: bool,
+    /// Whether the model was given its final turn after looping past the warning.
+    pub final_chance: bool,
+    /// Final turns given this run (never reset: the hard stop).
+    pub rescues: u32,
+    /// Distinct calls that ran and succeeded since the warning.
+    pub progress: std::collections::HashSet<ToolCallKey>,
+    /// Warnings given in a row to loops of read-only calls (since the last progress).
+    pub read_only_warnings: u32,
+}
+
+impl ToolLoopState {
+    /// A loop was detected (by [`tool_loop_detected`] or the failing-command guard): what to do about it.
+    pub fn escalate(&mut self) -> LoopVerdict {
+        self.progress.clear();
+        if !self.warned {
+            self.warned = true;
+            return LoopVerdict::Warn;
+        }
+        if !self.final_chance && self.rescues < MAX_TOOL_LOOP_RESCUES {
+            self.final_chance = true;
+            self.rescues += 1;
+            return LoopVerdict::FinalChance;
+        }
+        LoopVerdict::Stop
+    }
+
+    /// A loop of read-only calls was detected: a warning, up to [`MAX_READ_ONLY_LOOP_WARNINGS`] times in a row, then
+    /// [`Self::escalate`] (the final turn, then the stop).
+    pub fn escalate_read_only(&mut self) -> LoopVerdict {
+        if self.read_only_warnings < MAX_READ_ONLY_LOOP_WARNINGS && !self.final_chance {
+            self.progress.clear();
+            self.warned = true;
+            self.read_only_warnings += 1;
+            return LoopVerdict::Warn;
+        }
+        self.escalate()
+    }
+
+    /// A call ran and succeeded. After a warning, [`TOOL_LOOP_PROGRESS`] distinct ones forget it (and the final turn).
+    pub fn progressed(&mut self, key: ToolCallKey) {
+        if !self.warned {
+            return;
+        }
+        self.progress.insert(key);
+        if self.progress.len() >= TOOL_LOOP_PROGRESS {
+            self.warned = false;
+            self.final_chance = false;
+            self.read_only_warnings = 0;
+            self.progress.clear();
+        }
+    }
+}
+
+/// Prints `value` as compact JSON with every object's keys sorted, at every depth (nothing dropped).
+/// Done by hand so it doesn't depend on whether serde_json's `preserve_order` feature is on.
+fn canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        leaf => out.push_str(&leaf.to_string()),
+    }
+}
+
+pub fn make_tool_key(name: &str, arguments: &str) -> ToolCallKey {
+    let args = match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => {
+            let mut out = String::new();
+            canonical(&value, &mut out);
+            out
+        }
+        Err(_) => arguments.to_string(),
+    };
+    ToolCallKey { name: name.to_string(), args }
+}
+
+/// A period-1 or period-2 cycle at the end of `history`. The most recent steps decide: what came
+/// before a loop started (its first call, which had no earlier result to repeat) doesn't hide it.
+fn cycle_detected(history: &[Vec<ToolCallKey>]) -> bool {
+    let n = history.len();
+    // Period 1: the last 3 steps are the same.
+    if n >= 3 && history[n - 1] == history[n - 2] && history[n - 2] == history[n - 3] {
+        return true;
+    }
+    // Period 2: the last 5 steps go A,B,A,B,A (with A ≠ B).
+    if n >= 5 && history[n - 1] != history[n - 2] {
+        return (n - 5..n - 2).all(|i| history[i] == history[i + 2]);
+    }
+    false
+}
+
+/// Adds a step's calls to the state. Returns true when a loop is detected.
+pub fn tool_loop_detected(state: &mut ToolLoopState, calls: Vec<ToolCallKey>) -> bool {
+    // A write tool resets the entire history: re-reading a file after editing it is legitimate.
+    if calls.iter().any(|c| WRITE_TOOLS.contains(&c.name.as_str())) {
+        state.history = vec![calls];
+        return false;
+    }
+    // Only steps with the same number of calls are comparable.
+    if state.history.last().is_some_and(|prev| prev.len() != calls.len()) {
+        state.history = vec![calls];
+        return false;
+    }
+    state.history.push(calls);
+    // Enough to spot periods 1 and 2, cheap.
+    if state.history.len() > TOOL_HISTORY {
+        state.history.remove(0);
+    }
+    cycle_detected(&state.history)
+}
+
+/// Failures of the same command, with the same signature, that make another try a loop.
+pub const FAILURE_REPEATS: usize = 2;
+/// Tools that only read: a call to one keeps the failures. Any other tool besides bash (`edit_file`, `write_file`, a
+/// subagent that edits, `process` starting the server a test needed, an MCP tool) may have changed what the command
+/// fails on, so a call to it forgets every failure (the next try may fare differently).
+pub const READ_ONLY_TOOLS: [&str; 6] = ["read_file", "glob", "grep", "web_fetch", "plan", "skill"];
+/// A signature is cut to this many characters.
+const SIGNATURE_CHARS: usize = 160;
+
+/// How bash's network note (`marv_sandbox::notes::NETWORK_NOTE`, #23) starts; marv-agent doesn't depend on
+/// marv-sandbox, so marv-session's tests hold the two together.
+pub const NETWORK_NOTE_START: &str = "Marv: this command ran in the sandbox without network";
+
+/// A line that says something failed, whatever the exit code (`git clone … || true` still printed it).
+fn strong_error(lower: &str) -> bool {
+    const STARTS: [&str; 5] = ["fatal:", "error:", "error[", "npm err!", "err!"];
+    const CONTAINS: [&str; 13] = [
+        "could not resolve",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "connection refused",
+        "connection timed out",
+        "failed to connect",
+        "unable to access",
+        "no route to host",
+        "permission denied",
+        "no such file or directory",
+        "command not found",
+        "no one to ask",
+    ];
+    STARTS.iter().any(|s| lower.starts_with(s)) || CONTAINS.iter().any(|c| lower.contains(c))
+}
+
+/// A line that may say what failed, counted only when the command did fail ("0 failed" in a passing run isn't one).
+fn weak_error(lower: &str) -> bool {
+    const WORDS: [&str; 8] = ["error", "failed", "failure", "cannot", "can't", "unable", "not found", "denied"];
+    WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// Lowercased, digits as `#`, whitespace collapsed: a line number or a duration doesn't make a new error.
+fn normalize_line(line: &str) -> String {
+    let mapped: String = line.chars().map(|c| if c.is_ascii_digit() { '#' } else { c.to_ascii_lowercase() }).collect();
+    mapped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a bash result's failure looks like, or `None` when it didn't fail. Marv's own `Marv:` lines are skipped. Its
+/// first line that says something failed whatever the exit code (`fatal:`, `could not resolve host`, …); for a failed
+/// one (an exit code other than 0, a timeout, or no ending at all: refused, declined), else its first line with an
+/// error word, else its ending and last line. Each as `(normalized, shown)`.
+pub fn failure_signature(result: &str) -> Option<(String, String)> {
+    let lines: Vec<&str> = result.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("Marv:")).collect();
+    let ending = lines.iter().rev().find(|l| l.starts_with("[exit code ") || l.starts_with("[timed out")).copied();
+    // A command that exited 0 worked (`grep -i error app.log` prints errors and succeeds), unless bash's network note
+    // says `|| true` hid a failure like the missing network's.
+    if ending == Some("[exit code 0]") && !result.contains(NETWORK_NOTE_START) {
+        return None;
+    }
+    let pick = |line: &str| {
+        let shown: String = line.chars().take(SIGNATURE_CHARS).collect();
+        Some((normalize_line(&shown), shown))
+    };
+    if let Some(line) = lines.iter().find(|l| strong_error(&l.to_lowercase())) {
+        return pick(line);
+    }
+    if ending == Some("[exit code 0]") {
+        return None;
+    }
+    if let Some(line) = lines.iter().find(|l| weak_error(&l.to_lowercase())) {
+        return pick(line);
+    }
+    let last = lines.iter().rev().find(|l| Some(**l) != ending).copied().unwrap_or("");
+    pick(&format!("{} {last}", ending.unwrap_or("")))
+}
+
+/// A bash call's command.
+fn command_of(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments).ok()?.get("command")?.as_str().map(str::to_string)
+}
+
+/// The failing-command key of a call: bash only, by its command's key and the flags that change where it runs.
+pub fn command_call_key(name: &str, arguments: &str) -> Option<String> {
+    if name != "bash" {
+        return None;
+    }
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    let command = args.get("command")?.as_str()?;
+    let net = if args.get("network").and_then(Value::as_bool) == Some(true) { "net:" } else { "" };
+    let host = if args.get("sandbox").and_then(Value::as_bool) == Some(false) { "host:" } else { "" };
+    Some(format!("{net}{host}{}", marv_core::command::command_key(command)))
+}
+
+/// One command's failures in a row: (normalized signature, the line shown, how many times).
+#[derive(Debug, Clone, PartialEq)]
+struct Failures {
+    signature: String,
+    shown: String,
+    count: usize,
+}
+
+/// Failing bash commands since the last call that may have changed things (see the module notes).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FailureLoopState {
+    failures: std::collections::HashMap<String, Failures>,
+}
+
+impl FailureLoopState {
+    /// Notes a call's result: a call that may change things (an edit, a subagent, `process`) forgets everything; a bash command's failure counts (the same signature as
+    /// last time: one more; another: the first), its success forgets it.
+    pub fn record(&mut self, name: &str, arguments: &str, result: &str) {
+        if name != "bash" {
+            if !READ_ONLY_TOOLS.contains(&name) {
+                self.failures.clear();
+            }
+            return;
+        }
+        let Some(key) = command_call_key(name, arguments) else { return };
+        // Only Marv's own words (the note of a call this guard didn't run): nothing ran, nothing to learn.
+        if result.lines().map(str::trim).all(|l| l.is_empty() || l.starts_with("Marv:")) {
+            return;
+        }
+        match failure_signature(result) {
+            // A success that may have changed things (`npm install`) gives every command a fresh start; a probe
+            // that only reads (`echo test`, `whoami`) changes nothing.
+            None if !command_of(arguments).is_some_and(|c| marv_core::command::is_read_only_command(&c)) => {
+                self.failures.clear();
+            }
+            None => {
+                self.failures.remove(&key);
+            }
+            Some((signature, shown)) => {
+                let count = self.failures.get(&key).filter(|f| f.signature == signature).map_or(0, |f| f.count);
+                self.failures.insert(key, Failures { signature, shown, count: count + 1 });
+            }
+        }
+    }
+
+    /// For a call that would be another try of a command that already failed the same way [`FAILURE_REPEATS`]
+    /// times: how many times, and the line its failure showed.
+    pub fn repeated(&self, name: &str, arguments: &str) -> Option<(usize, String)> {
+        let key = command_call_key(name, arguments)?;
+        self.failures.get(&key).filter(|f| f.count >= FAILURE_REPEATS).map(|f| (f.count, f.shown.clone()))
+    }
+}
+
+/// Whether every call of a step only reads ([`READ_ONLY_TOOLS`]): a loop of them is escalated more gently.
+pub fn only_reads(names: &[&str]) -> bool {
+    !names.is_empty() && names.iter().all(|name| READ_ONLY_TOOLS.contains(name))
+}
+
+/// How `read_file`'s page ends when the file goes on (Marv's `read-file.ts`, byte for byte: `(Showing lines 1-400 of
+/// 586. Use offset=401 to read more.)`). marv-tools isn't a dependency, so marv-session's tests hold the two together.
+pub const READ_MORE_START: &str = " Use offset=";
+pub const READ_MORE_END: &str = " to read more.)";
+
+/// The offset a `read_file` result says to pass to read on, when the page it showed isn't the end of the file. Only
+/// when that's how the result ends, so a file whose own text says it is never mistaken for one.
+pub fn next_page_offset(output: &str) -> Option<usize> {
+    let rest = output.trim_end().strip_suffix(READ_MORE_END)?;
+    let at = rest.rfind(READ_MORE_START)?;
+    rest[at + READ_MORE_START.len()..].parse().ok().filter(|&n| n > 1)
+}
+
+/// `arguments` with `offset` set, for the runner only: the call in the history keeps the model's own bytes (prompt
+/// cache). `None` when they aren't a JSON object.
+pub fn with_offset(arguments: &str, offset: usize) -> Option<String> {
+    let mut value = serde_json::from_str::<Value>(arguments).ok()?;
+    value.as_object_mut()?.insert("offset".into(), Value::from(offset));
+    Some(value.to_string())
+}
+
+/// What a repeated truncated read's result starts with: it got the next page instead of the same one again.
+pub fn read_on_note(offset: usize) -> String {
+    format!(
+        "Marv: this exact call already returned the page before this one, so Marv read on from line {offset} (as if you had sent \"offset\": {offset}). To choose the lines yourself, pass offset.\n\n"
+    )
+}
+
+/// The next page for each `read_file` call whose last result had more after it (see the module notes).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReadPages {
+    next: std::collections::HashMap<ToolCallKey, usize>,
+}
+
+impl ReadPages {
+    /// Notes a call that ran and its result (the tool's own text).
+    pub fn record(&mut self, name: &str, arguments: &str, output: &str) {
+        if name == "read_file" {
+            let key = make_tool_key(name, arguments);
+            match next_page_offset(output) {
+                Some(offset) => {
+                    self.next.insert(key, offset);
+                }
+                None => {
+                    self.next.remove(&key);
+                }
+            }
+            return;
+        }
+        let reads = READ_ONLY_TOOLS.contains(&name)
+            || (name == "bash" && command_of(arguments).is_some_and(|c| marv_core::command::is_read_only_command(&c)));
+        if !reads {
+            self.next.clear();
+        }
+    }
+
+    /// The offset to run this call with instead, when it repeats a read whose page had more after it.
+    pub fn next(&self, name: &str, arguments: &str) -> Option<usize> {
+        if name != "read_file" {
+            return None;
+        }
+        self.next.get(&make_tool_key(name, arguments)).copied()
+    }
+
+    /// The history no longer holds the pages (a compaction): a repeated read is a real one again.
+    pub fn clear(&mut self) {
+        self.next.clear();
+    }
+}
+
+/// The result of a call that wasn't run because its command keeps failing the same way.
+pub fn failing_command_note(count: usize, shown: &str) -> String {
+    format!(
+        "Marv: not run. This command already failed {count} times in a row the same way (\"{shown}\"), with nothing changed in between, so another try would fail too (a different tail on the command doesn't change that). Use what it said: change the approach, do without it, or tell the user what's in the way."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Ported from tests/repetition.test.ts.
+
+    #[test]
+    fn splits_on_period_followed_by_space() {
+        assert_eq!(split_sentences("Hello world. How are you? I'm fine."), ["Hello world.", "How are you?", "I'm fine."]);
+    }
+
+    #[test]
+    fn splits_on_newlines_too() {
+        assert_eq!(split_sentences("Line one.\nLine two.\nLine three."), ["Line one.", "Line two.", "Line three."]);
+    }
+
+    #[test]
+    fn a_run_on_without_punctuation_is_one_unit() {
+        assert_eq!(
+            split_sentences("Fix the test scripts now Fix the test scripts now"),
+            ["Fix the test scripts now Fix the test scripts now"]
+        );
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert!(split_sentences("").is_empty());
+    }
+
+    #[test]
+    fn a_sentence_repeated_50_times_without_newlines_is_caught() {
+        assert!(detect_text_repetition(&"Fix the test scripts now. ".repeat(50)));
+    }
+
+    #[test]
+    fn a_normal_paragraph_with_two_repeated_sentences_is_not_caught() {
+        let text = "I looked at the file and it needs work. Fix the test scripts now. Fix the test scripts now. The rest of the function looks okay.";
+        assert!(!detect_text_repetition(text));
+    }
+
+    #[test]
+    fn a_sentence_repeated_7_times_is_not_caught() {
+        assert!(!detect_text_repetition(&["Fix the test scripts now."; 7].join(". ")));
+    }
+
+    #[test]
+    fn different_sentences_are_not_caught() {
+        let text = "First step: install dependencies. Second step: configure the module. Third step: run the tests. Fourth step: verify the output.";
+        assert!(!detect_text_repetition(text));
+    }
+
+    #[test]
+    fn short_units_are_ignored() {
+        assert!(!detect_text_repetition(&["- milk"; 10].join("\n")));
+    }
+
+    #[test]
+    fn blank_lines_do_not_trigger() {
+        let text = format!("Some text{}", "\n".repeat(10));
+        assert!(!detect_text_repetition(&text));
+    }
+
+    #[test]
+    fn code_with_different_lines_is_not_caught() {
+        let text = (1..=9).map(|i| format!("const v{i} = {i};")).collect::<Vec<_>>().join("\n");
+        assert!(!detect_text_repetition(&text));
+    }
+
+    #[test]
+    fn fewer_than_8_units_does_not_trigger() {
+        assert!(!detect_text_repetition("One line."));
+        assert!(!detect_text_repetition(""));
+    }
+
+    #[test]
+    fn a_sentence_repeated_8_times_with_newlines_is_caught() {
+        assert!(detect_text_repetition(&["Fix the test scripts now."; 8].join("\n")));
+    }
+
+    #[test]
+    fn a_burst_at_the_end_of_a_long_reply_is_caught() {
+        let text = format!(
+            "{}{}",
+            "Varied words go here and there. ".chars().cycle().take(10_000).collect::<String>().replace('.', ","),
+            "Fix the test scripts now. ".repeat(10)
+        );
+        assert!(detect_text_repetition(&text));
+    }
+
+    #[test]
+    fn a_loop_escalates_warn_final_chance_stop() {
+        let mut state = ToolLoopState::default();
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        assert_eq!(state.escalate(), LoopVerdict::Stop);
+    }
+
+    #[test]
+    fn progress_forgets_the_warning_but_final_turns_are_capped() {
+        let mut state = ToolLoopState::default();
+        let progress = |state: &mut ToolLoopState, n: usize| {
+            for i in 0..n {
+                state.progressed(make_tool_key("read_file", &format!(r#"{{"path":"f{i}"}}"#)));
+            }
+        };
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        // The same call over and over is not progress.
+        for _ in 0..10 {
+            state.progressed(make_tool_key("read_file", r#"{"path":"a"}"#));
+        }
+        assert!(state.warned);
+        // It counts once: with TOOL_LOOP_PROGRESS - 2 other calls, still short.
+        progress(&mut state, TOOL_LOOP_PROGRESS - 2);
+        assert!(state.warned);
+        progress(&mut state, TOOL_LOOP_PROGRESS);
+        assert!(!state.warned);
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        progress(&mut state, TOOL_LOOP_PROGRESS);
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        progress(&mut state, TOOL_LOOP_PROGRESS);
+        // Past MAX_TOOL_LOOP_RESCUES final turns, a loop past the warning ends the run.
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::Stop);
+        assert_eq!(state.rescues, MAX_TOOL_LOOP_RESCUES);
+    }
+
+    #[test]
+    fn parsed_json_arguments_are_normalized() {
+        assert_eq!(
+            make_tool_key("read_file", r#"{"path": "a.ts"}"#),
+            ToolCallKey { name: "read_file".into(), args: r#"{"path":"a.ts"}"#.into() }
+        );
+    }
+
+    #[test]
+    fn unparseable_json_is_kept_as_is() {
+        assert_eq!(make_tool_key("bash", "not json").args, "not json");
+    }
+
+    #[test]
+    fn differently_ordered_keys_are_normalized() {
+        assert_eq!(
+            make_tool_key("read_file", r#"{"path": "a.ts", "offset": 1}"#),
+            make_tool_key("read_file", r#"{"offset": 1, "path": "a.ts"}"#)
+        );
+    }
+
+    #[test]
+    fn nested_fields_count_and_key_order_at_any_depth_does_not() {
+        let key = |args: &str| make_tool_key("q", args).args;
+        assert_ne!(key(r#"{"filter":{"id":1}}"#), key(r#"{"filter":{"id":2}}"#));
+        assert_eq!(
+            key(r#"{"a":1,"filter":{"x":1,"y":[{"b":2,"a":1}]}}"#),
+            key(r#"{"filter":{"y":[{"a":1,"b":2}],"x":1},"a":1}"#)
+        );
+    }
+
+    fn read(args: &str) -> ToolCallKey {
+        ToolCallKey { name: "read_file".into(), args: args.into() }
+    }
+
+    #[test]
+    fn a_single_step_is_nothing() {
+        let mut state = ToolLoopState::default();
+        assert!(!tool_loop_detected(&mut state, vec![read("a")]));
+        assert_eq!(state.history, vec![vec![read("a")]]);
+    }
+
+    #[test]
+    fn period_1_is_detected() {
+        let mut state = ToolLoopState::default();
+        tool_loop_detected(&mut state, vec![read("a")]);
+        tool_loop_detected(&mut state, vec![read("a")]);
+        assert!(tool_loop_detected(&mut state, vec![read("a")]));
+    }
+
+    #[test]
+    fn period_2_is_detected() {
+        let mut state = ToolLoopState::default();
+        for args in ["95", "98", "95", "98"] {
+            assert!(!tool_loop_detected(&mut state, vec![read(args)]));
+        }
+        assert!(tool_loop_detected(&mut state, vec![read("95")]));
+    }
+
+    #[test]
+    fn period_3_does_not_trigger() {
+        let mut state = ToolLoopState::default();
+        for i in 0..6 {
+            tool_loop_detected(&mut state, vec![read(["a", "b", "c"][i % 3])]);
+        }
+        assert!(state.history.len() <= TOOL_HISTORY);
+        assert!(!tool_loop_detected(&mut state, vec![read("a")]));
+    }
+
+    #[test]
+    fn a_write_tool_resets_the_history() {
+        let mut state = ToolLoopState::default();
+        tool_loop_detected(&mut state, vec![read("a")]);
+        tool_loop_detected(&mut state, vec![read("a")]);
+        tool_loop_detected(&mut state, vec![ToolCallKey { name: "write_file".into(), args: "{}".into() }]);
+        assert_eq!(state.history.len(), 1);
+        tool_loop_detected(&mut state, vec![read("a")]);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[0][0].name, "write_file");
+    }
+
+    #[test]
+    fn a_step_with_a_different_number_of_calls_resets() {
+        let mut state = ToolLoopState::default();
+        tool_loop_detected(&mut state, vec![read("a")]);
+        tool_loop_detected(&mut state, vec![read("a")]);
+        tool_loop_detected(&mut state, vec![read("a"), read("b")]);
+        assert_eq!(state.history.len(), 1);
+    }
+
+    // Issue #81: failing commands whose tail differs.
+
+    fn bash(command: &str) -> String {
+        serde_json::json!({ "command": command }).to_string()
+    }
+    const OFFLINE: &str = "Cloning into 'marv'...\nfatal: unable to access 'https://github.com/Flologix/marv/': Could not resolve host: github.com\n\n[exit code 128]";
+
+    #[test]
+    fn the_signature_is_the_first_line_that_says_what_failed() {
+        let (normalized, shown) = failure_signature(OFFLINE).unwrap();
+        assert!(shown.starts_with("fatal: unable to access"));
+        assert_eq!(normalized, shown.to_lowercase());
+        // Exit 0 isn't a failure, unless bash's network note says `|| true` hid one.
+        let hidden = OFFLINE.replace("[exit code 128]", "[exit code 0]");
+        assert!(failure_signature(&hidden).is_none());
+        let noted = OFFLINE.replace("[exit code 128]", &format!("{NETWORK_NOTE_START}.\n\n[exit code 0]"));
+        assert_eq!(failure_signature(&noted).unwrap().1, shown);
+        // Line numbers and durations don't make it new.
+        assert_eq!(
+            failure_signature("error: x.rs:12 broke\n\n[exit code 1]").unwrap().0,
+            failure_signature("error: x.rs:13 broke\n\n[exit code 1]").unwrap().0
+        );
+        // Marv's notes aren't the command's output.
+        assert!(failure_signature("ok\n\n[exit code 0]\n\nMarv: this command failed before").is_none());
+    }
+
+    #[test]
+    fn a_passing_run_has_no_signature_even_with_error_words_in_it() {
+        assert!(failure_signature("test result: ok. 12 passed; 0 failed\n\n[exit code 0]").is_none());
+        assert!(failure_signature("(no output)\n\n[exit code 0]").is_none());
+        // A failed one without error words is its ending and last line; one without an ending (refused) its line.
+        assert_eq!(failure_signature("(no output)\n\n[exit code 1]").unwrap().1, "[exit code 1] (no output)");
+        assert!(failure_signature("bash needs the user's approval, and there's no one to ask.").is_some());
+    }
+
+    #[test]
+    fn the_same_failure_twice_makes_the_next_try_a_loop_whatever_its_tail() {
+        let mut state = FailureLoopState::default();
+        state.record("bash", &bash("git clone https://github.com/Flologix/marv 2>&1 | tail -2"), OFFLINE);
+        assert!(state.repeated("bash", &bash("git clone https://github.com/Flologix/marv")).is_none());
+        // A probe in between neither counts nor resets.
+        state.record("bash", &bash("echo test"), "test\n\n[exit code 0]");
+        state.record("bash", &bash("git clone https://github.com/Flologix/marv && du -sh marv"), OFFLINE);
+        let (count, shown) = state.repeated("bash", &bash("git clone https://github.com/Flologix/marv || true")).unwrap();
+        assert_eq!(count, 2);
+        assert!(shown.contains("Could not resolve host"));
+        assert!(failing_command_note(count, &shown).starts_with("Marv: not run. This command already failed 2 times"));
+        // With network it's another command; so is another clone.
+        assert!(
+            state.repeated("bash", r#"{"command": "git clone https://github.com/Flologix/marv", "network": true}"#).is_none()
+        );
+        assert!(state.repeated("bash", &bash("git clone https://github.com/Flologix/other")).is_none());
+        assert!(state.repeated("read_file", r#"{"path": "a"}"#).is_none());
+    }
+
+    #[test]
+    fn an_edit_a_success_or_another_error_resets_it() {
+        let test = bash("cargo test");
+        let failing = "error[E0308]: mismatched types\n\n[exit code 101]";
+        let twice = || {
+            let mut state = FailureLoopState::default();
+            state.record("bash", &test, failing);
+            state.record("bash", &test, failing);
+            assert!(state.repeated("bash", &test).is_some());
+            state
+        };
+        // Re-running the tests after an edit is never a loop.
+        let mut edited = twice();
+        edited.record("edit_file", r#"{"path": "src/a.rs"}"#, "Edited src/a.rs");
+        assert!(edited.repeated("bash", &test).is_none());
+        let mut passed = twice();
+        passed.record("bash", &test, "test result: ok\n\n[exit code 0]");
+        assert!(passed.repeated("bash", &test).is_none());
+        let mut other = twice();
+        other.record("bash", &test, "error[E0425]: cannot find value\n\n[exit code 101]");
+        assert!(other.repeated("bash", &test).is_none());
+        other.record("bash", &test, "error[E0425]: cannot find value\n\n[exit code 101]");
+        assert!(other.repeated("bash", &test).is_some());
+    }
+
+    // Greptile on #111: the guard must never block useful work.
+
+    #[test]
+    fn a_successful_read_of_error_text_never_counts() {
+        let mut state = FailureLoopState::default();
+        let grep = bash("grep -i error app.log");
+        for _ in 0..4 {
+            state.record("bash", &grep, "error: disk full at 10:42\nerror: retrying\n\n[exit code 0]");
+        }
+        assert!(state.repeated("bash", &grep).is_none());
+        assert!(failure_signature("fatal: something\n\n[exit code 0]").is_none());
+    }
+
+    #[test]
+    fn a_clone_hidden_by_or_true_still_counts_when_it_carries_the_network_note() {
+        let hidden = format!(
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com\n\n{NETWORK_NOTE_START}, and its failure looks like it may come from that.\n\n[exit code 0]"
+        );
+        let mut state = FailureLoopState::default();
+        let clone = bash("git clone https://github.com/x/y || true");
+        state.record("bash", &clone, &hidden);
+        state.record("bash", &clone, &hidden);
+        assert!(state.repeated("bash", &bash("git clone https://github.com/x/y")).is_some());
+    }
+
+    #[test]
+    fn a_successful_command_that_may_change_things_resets_every_count_a_probe_doesnt() {
+        let test = bash("npm test");
+        let failing = "error: 3 tests failed\n\n[exit code 1]";
+        let twice = || {
+            let mut state = FailureLoopState::default();
+            state.record("bash", &test, failing);
+            state.record("bash", &test, failing);
+            state
+        };
+        let mut probed = twice();
+        probed.record("bash", &bash("echo test"), "test\n\n[exit code 0]");
+        probed.record("bash", &bash("whoami"), "me\n\n[exit code 0]");
+        assert!(probed.repeated("bash", &test).is_some());
+        let mut installed = twice();
+        installed.record("bash", &bash("npm install"), "added 3 packages\n\n[exit code 0]");
+        assert!(installed.repeated("bash", &test).is_none());
+        // So does any tool that may change things, like a subagent that fixed the code or a server started for the
+        // tests; a read doesn't.
+        for tool in ["agent", "process", "mcp_call"] {
+            let mut other = twice();
+            other.record(tool, r#"{"prompt": "fix the tests"}"#, "Done: fixed src/a.rs");
+            assert!(other.repeated("bash", &test).is_none(), "{tool}");
+        }
+        let mut read = twice();
+        read.record("read_file", r#"{"path": "src/a.rs"}"#, "fn a() {}");
+        read.record("grep", r#"{"pattern": "a"}"#, "src/a.rs:1: fn a() {}");
+        assert!(read.repeated("bash", &test).is_some());
+        // A failed install changed nothing that counts.
+        let mut failed = twice();
+        failed.record("bash", &bash("npm install"), "npm ERR! network\n\n[exit code 1]");
+        assert!(failed.repeated("bash", &test).is_some());
+    }
+
+    // marv-rs: read-only loops and repeated truncated reads (TB 2026-11-06 schemelike-metacircular-eval).
+
+    #[test]
+    fn a_read_only_loop_is_warned_about_five_times_before_the_final_turn_and_the_stop() {
+        let mut state = ToolLoopState::default();
+        for _ in 0..MAX_READ_ONLY_LOOP_WARNINGS {
+            assert_eq!(state.escalate_read_only(), LoopVerdict::Warn);
+        }
+        assert_eq!(state.escalate_read_only(), LoopVerdict::FinalChance);
+        assert_eq!(state.escalate_read_only(), LoopVerdict::Stop);
+        // A loop with side effects escalates as before.
+        let mut state = ToolLoopState::default();
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        assert_eq!(state.escalate(), LoopVerdict::Stop);
+    }
+
+    #[test]
+    fn progress_forgets_the_read_only_warnings() {
+        let mut state = ToolLoopState::default();
+        for _ in 0..MAX_READ_ONLY_LOOP_WARNINGS {
+            state.escalate_read_only();
+        }
+        for i in 0..TOOL_LOOP_PROGRESS {
+            state.progressed(make_tool_key("read_file", &format!(r#"{{"path":"f{i}"}}"#)));
+        }
+        assert_eq!(state.read_only_warnings, 0);
+        assert_eq!(state.escalate_read_only(), LoopVerdict::Warn);
+    }
+
+    #[test]
+    fn only_reads_is_every_call_read_only() {
+        assert!(only_reads(&["read_file", "grep", "glob"]));
+        assert!(!only_reads(&["read_file", "bash"]));
+        assert!(!only_reads(&["process"]));
+        assert!(!only_reads(&[]));
+    }
+
+    const PAGE_1: &str = "    1→#!/usr/bin/env python3\n  400→x\n\n(Showing lines 1-400 of 586. Use offset=401 to read more.)";
+    const PAGE_2: &str = "  401→y\n  586→z\n\n(Showing lines 401-586 of 586.)";
+
+    #[test]
+    fn the_next_page_offset_is_read_from_the_end_of_a_result_only() {
+        assert_eq!(next_page_offset(PAGE_1), Some(401));
+        assert_eq!(next_page_offset(&format!("{PAGE_1}\n")), Some(401));
+        assert_eq!(next_page_offset(PAGE_2), None);
+        // A file whose text says it, not at the end of the result.
+        assert_eq!(next_page_offset(&format!("    1→Use offset=9 to read more.)\n{PAGE_2}")), None);
+        assert_eq!(next_page_offset("(Showing lines 1-1 of 9. Use offset=x to read more.)"), None);
+    }
+
+    #[test]
+    fn with_offset_sets_the_field_and_keeps_the_rest() {
+        let args = with_offset(r#"{"path": "interp.py", "limit": 50}"#, 401).unwrap();
+        let value: Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(value, serde_json::json!({"path": "interp.py", "limit": 50, "offset": 401}));
+        assert_eq!(with_offset("not json", 3), None);
+        assert!(read_on_note(401).contains(r#""offset": 401"#));
+    }
+
+    #[test]
+    fn a_repeated_truncated_read_reads_on_until_the_file_may_have_changed() {
+        let mut pages = ReadPages::default();
+        let call = r#"{"path": "interp.py"}"#;
+        assert_eq!(pages.next("read_file", call), None);
+        pages.record("read_file", call, PAGE_1);
+        // The same call, its keys in another order or spaced differently, is the same read.
+        assert_eq!(pages.next("read_file", r#"{"path":"interp.py"}"#), Some(401));
+        assert_eq!(pages.next("read_file", r#"{"path": "other.py"}"#), None);
+        // Reads and read-only commands keep it; the last page forgets it.
+        pages.record("grep", r#"{"pattern": "x"}"#, "1 match");
+        pages.record("bash", r#"{"command": "ls -la"}"#, "[exit code 0]");
+        assert_eq!(pages.next("read_file", call), Some(401));
+        pages.record("read_file", call, &format!("{}{PAGE_2}", read_on_note(401)));
+        assert_eq!(pages.next("read_file", call), None);
+        // A command that may change the file forgets every page.
+        pages.record("read_file", call, PAGE_1);
+        pages.record("bash", r#"{"command": "sed -i s/a/b/ interp.py"}"#, "[exit code 0]");
+        assert_eq!(pages.next("read_file", call), None);
+        pages.record("read_file", call, PAGE_1);
+        pages.record("edit_file", r#"{"path": "interp.py"}"#, "ok");
+        assert_eq!(pages.next("read_file", call), None);
+        pages.record("read_file", call, PAGE_1);
+        pages.clear();
+        assert_eq!(pages.next("read_file", call), None);
+    }
+}

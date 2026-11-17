@@ -1,0 +1,17 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/libexec/marv-os/marv": "binaries/marv"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/libexec/marv-os/marv": "binaries/marv"
+        }
+      }
+    }
+  }
+}

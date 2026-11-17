@@ -1,0 +1,33 @@
+Marv OS
+Copyright 2026 FlologixAI Inc.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE). "Marv", "Marv OS", the Martian and the FlologixAI name
+and logo are trademarks of FlologixAI Inc. and are not licensed by Apache 2.0 (see TRADEMARKS.md).
+
+This product includes the following third-party material.
+
+Source in this repository
+
+- app/src-tauri/src/agent_detect/ is ported from herdr (https://github.com/herdrdev/herdr), Apache License 2.0.
+  Its licence text is kept beside the code in app/src-tauri/src/agent_detect/HERDR-LICENSE.
+
+Bundled in the installers (fetched by the release workflows, pinned and checked by SHA-256)
+
+- Microsoft ConPTY (conpty.dll and OpenConsole.exe, from the Microsoft.Windows.Console.ConPTY package of
+  https://github.com/microsoft/terminal), MIT License, Copyright (c) Microsoft Corporation. Bundled in the Windows
+  installer; the licence text ships as ConPTY-LICENSE.txt (source: app/src-tauri/windows/ConPTY-LICENSE.txt).
+- lazygit (https://github.com/jesseduffield/lazygit), MIT License, Copyright (c) Jesse Duffield. Bundled in the
+  Windows and macOS installers for the Git tab; its licence ships as lazygit-LICENSE.txt.
+
+Bundled in the desktop app's web page (installed from npm, see app/package.json and app/package-lock.json)
+
+- IBM Plex Sans and IBM Plex Mono, Copyright IBM Corp., and Jost, Copyright The Jost Project Authors, all under the
+  SIL Open Font License 1.1, through the @fontsource packages.
+- xterm.js (@xterm/xterm and its addons), MIT License, for the terminals.
+- React, react-markdown, remark-gfm and the Tauri JavaScript API, each under its own permissive licence.
+- The colour palette follows Flexoki by Steph Ango (https://stephango.com/flexoki), MIT License.
+
+Rust dependencies
+
+- The Rust crates in Cargo.lock are built into the binaries under their own licences (mostly MIT and Apache-2.0).
+  Run `cargo metadata` or a tool such as cargo-about to list them.

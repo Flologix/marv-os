@@ -1,0 +1,78 @@
+[package]
+name = "marv-desktop"
+description = "Marv desktop: a folder tree and Marv chats on the folders you pick, in a Tauri window."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "marv_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.3", features = [] }
+
+[dependencies]
+marv-fs.workspace = true
+marv-sandbox.workspace = true
+marv-web = { path = "../../crates/marv-web" }
+marv-session.workspace = true
+marv-kernel.workspace = true
+# The registry the chats' mesh_list reads (runtime-kernel 3).
+marv-mesh.workspace = true
+# A resident chat as a `chat_read` source (runtime-kernel §9.2).
+async-trait.workspace = true
+marv-core.workspace = true
+marv-mcp.workspace = true
+url = "2.5.4"
+marv-provider.workspace = true
+# A team's write paths are checked as a role file's (`marv_tools::write_set`).
+marv-tools.workspace = true
+tokio-util.workspace = true
+tauri = { version = "2.12.4", features = [] }
+tauri-plugin-dialog = "2"
+# Copy from a chat's terminal (an agent's OSC 52, ctrl+shift+c): the web view's clipboard needs a click to write.
+tauri-plugin-clipboard-manager = "2"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { version = "1", features = ["v4"] }
+# Deleting from the tree moves to the desktop's trash, never rm -rf.
+trash = "5"
+notify-rust = "4"
+# Kernel #41: a new launch closes an earlier window that stopped responding.
+nix = { version = "0.31.3", features = ["signal", "process", "hostname"] }
+# The Marv plan (Settings › Marv plan): its server called from here, never the web view (the CSP stays shut), and the
+# licence's Ed25519 signature checked offline. The same reqwest, ring and base64 marv-provider builds.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+ring = "0.17"
+base64 = "0.22.1"
+# The dock's Git tab: lazygit on a terminal of its own (WezTerm's pty crate: the `unsafe` stays in it).
+portable-pty = "0.9.0"
+# Usage from the agents' own history: OpenCode keeps its in SQLite (read-only, bundled so no system library is needed).
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Every agent chat's state from its screen (`agent_detect`, herdr's rules): the rules are TOML and regexes, and the
+# screen model sizes wide characters as the person's terminal does. All three are already in the lockfile.
+regex = "1.11"
+toml = "0.8"
+unicode-width = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Kernel #41: the web view's web-process-terminated signal (the same webkit2gtk Tauri uses).
+webkit2gtk = { version = "2.0", features = ["v2_34"] }
+
+[target.'cfg(windows)'.dependencies]
+# Each terminal's agent in a Job Object that ends its whole tree when its handle closes (the terminal ended, or Marv
+# OS crashed). The crate's API is safe: the `unsafe` the Win32 calls need stays in it.
+win32job = "2.1.0"
+# Notifications as Marv, whose click opens the chat (notify.rs); notify-rust's own toast is PowerShell's.
+tauri-winrt-notification = "0.8.1"
+
+[dev-dependencies]
+# The chats' tests run real sessions against a scripted model, on a switchboard of their own.
+marv-guards = { path = "../../tests/guards" }
+futures.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

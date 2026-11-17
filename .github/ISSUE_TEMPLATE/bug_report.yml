@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in Marv OS doesn't work as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems: please don't file them here. Use "Report a vulnerability" on the Security tab.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Linux, macOS, Windows]
+    validations:
+      required: true
+  - type: input
+    id: os_version
+    attributes:
+      label: OS version and CPU
+      placeholder: "Ubuntu 24.04 x86_64, macOS 15 on Apple silicon, Windows 11 x64"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Marv OS version
+      description: Settings > About in the app.
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Which agent was the chat running?
+      description: Marv, Claude Code, Codex, OpenCode, Gemini CLI, your own agent, or a plain terminal. Include its version if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. ...\n2. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: |
+        Settings > About > Copy the log, or open marv-os.log yourself. Keys are scrubbed, but check it before you paste.
+        Linux: ~/.local/share/ai.flologix.marv/logs/marv-os.log
+        macOS: ~/Library/Logs/ai.flologix.marv/marv-os.log
+        Windows: %LOCALAPPDATA%\ai.flologix.marv\logs\marv-os.log
+      render: text

@@ -1,0 +1,36 @@
+[package]
+name = "marv-guards"
+description = "One guard test per docs/SECURITY.md rule, each proven by reverting its guard."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+marv-core.workspace = true
+marv-sandbox.workspace = true
+marv-tools.workspace = true
+marv-session.workspace = true
+marv-mcp.workspace = true
+marv-mesh.workspace = true
+marv-kernel.workspace = true
+# The desktop's chat driver: a resident chat reloaded for a wake (runtime-kernel 1).
+marv-web = { path = "../../crates/marv-web" }
+marv-oracle = { path = "../../crates/marv-oracle" }
+marv-provider.workspace = true
+marv-agent.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+nix = { version = "0.31.3", features = ["signal"] }
+
+[dev-dependencies]
+# The scan that only run_tool runs a tool (tests/tools.rs) parses the product's code.
+syn = { version = "2.0.119", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+quote = "1.0.47"
+
+[lints]
+workspace = true

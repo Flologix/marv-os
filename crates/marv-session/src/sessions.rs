@@ -1,0 +1,650 @@
+//! Saved sessions: every conversation is kept so it can be picked up again. Ports Marv's `src/sessions.ts`.
+//!
+//! `~/.marv/sessions/<project>/<id>.json`, 0600 (it holds your code and prompts), written atomically through
+//! [`write_private_under`]. A session holds both histories, kept separate as in the App: the transcript the user saw and the
+//! conversation the model saw, plus the model and what it cost. Files are shape-checked on load: an old format or a
+//! hand edit is skipped like a damaged file, never a crash. Sessions under the old project key are still found, but
+//! only if their recorded `root` matches (the old key collided), and move on their next save.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use marv_core::ChatTurn;
+use marv_fs::{random_hex, write_private, write_private_under};
+use marv_mcp::deferred::McpMode;
+use serde::{Deserialize, Serialize};
+
+use crate::paths::{legacy_project_key, project_key};
+use crate::types::{Message, Role};
+use crate::usage::Totals;
+
+pub const VERSION: u32 = 1;
+const TITLE_CHARS: usize = 56;
+
+/// A deferred-MCP conversation's listing (#14), saved with it; checked on resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpListing {
+    pub mode: McpMode,
+    pub announced: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSession {
+    pub version: u32,
+    pub id: String,
+    pub root: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub provider: String,
+    pub model: String,
+    /// What the model sees (with every tool call answered: `answer_all_calls`).
+    pub conversation: Vec<ChatTurn>,
+    /// What the user saw.
+    pub transcript: Vec<Message>,
+    pub totals: Totals,
+    /// Absent before a turn had MCP tools. A malformed value is dropped on load (`mcp_listing_of`), not fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<serde_json::Value>,
+    /// The plan tool's list (#15), when one is set. Kept as JSON and checked on resume (`plan_items`): a bad one is
+    /// dropped, not the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
+    /// The conversation's checkpoint chain (#16): its id (the session's own, or the one a resume started when the old
+    /// chain couldn't be read) and, per turn number, the paths its tools reported changing (an undo preview lists
+    /// those it can't restore). Absent in older files; checked on resume (`saved_checkpoints`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<serde_json::Value>,
+    /// A note for the model not yet sent (an undo's, #16): it leads the next user message. Checked on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_note: Option<serde_json::Value>,
+    /// marv-rs: what tainted the conversation (web, MCP, mesh, image), restored on resume: the outside text is still
+    /// in it. Absent in older files: `taint_sources` then infers it from the conversation's tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<Vec<marv_core::Provenance>>,
+    /// marv-rs #124 (phase 3): radio requests a turn read and hasn't reported on yet; the next turn that reads the
+    /// radio reports on them. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_requests: Option<Vec<marv_mesh::radio::OpenRequest>>,
+    /// Runtime-kernel §9.2: the conversation read another chat (`chat_read`), so its rule sends ask
+    /// (`TaintState::read_chat`). Restored on resume; absent in older files (then judged by its tool calls).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_chat: bool,
+    /// The teams whose chats the conversation read (`TaintState::read_teams`): their sends still run as their rules let
+    /// them. Restored on resume; absent in older files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_teams: Vec<String>,
+    /// #63: the last compaction's summary, which the conversation starts with: the next v2 compaction updates it
+    /// (rolling) rather than starting over. Absent in older files: the next summary is a full one (nothing is guessed
+    /// from the conversation's text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// #63 review: the summary follows the v2 template, so a v2 compaction may update it (rolling). A v1 summary (or one
+    /// from an older file) is summarized from scratch when v2 is switched on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_v2: bool,
+    /// marv-rs #202: saved while a turn ran (a turn is saved as it goes), so a Marv that quit mid-turn left it like
+    /// this: what cut it off ("Marv quit while `bash` waited for approval"). A resume marks the turn as cut off (a
+    /// notice, a note for the model) and clears it. Absent once the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_off: Option<String>,
+    /// marv-rs #202: the process that saved `cut_off`; a resume while it's alive (another Marv still in that turn)
+    /// doesn't mark the turn. Absent without `cut_off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Runtime-kernel §11.2: the context budget the person set for this chat (tokens), in place of `compactTokens`.
+    /// Absent: the default. Checked on resume (one below `MIN_COMPACT_TOKENS` is dropped, never used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget: Option<u64>,
+    /// The chat's role (`crate::roles`), fixed for its life: a resume into a session started as another role is
+    /// refused. Absent: no role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// A saved session's checkpoint chain and its turns' reported paths (#16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedCheckpoints {
+    pub chain: String,
+    pub reported: Vec<(u32, Vec<String>)>,
+}
+
+impl SavedSession {
+    /// The taint to restore on resume. Saved files say it; an older file (or one from TypeScript Marv) is judged by
+    /// its conversation, erring on the tainted side: a web call counts as web content, a github, MCP, mesh or herdr
+    /// call as theirs, and a subagent's report (which could carry any) as web content. Either way, what the
+    /// conversation's calls show for sure is added ([`SavedSession::taint_shown`]): a file saved before GitHub's and
+    /// networked commands' output tainted still holds that text.
+    pub fn taint_sources(&self) -> Vec<marv_core::Provenance> {
+        use marv_core::Provenance;
+        let mut sources = match &self.taint {
+            Some(saved) => saved.clone(),
+            None => {
+                let mut sources = Vec::new();
+                for turn in &self.conversation {
+                    let marv_core::ChatTurn::Tool { name, .. } = turn else { continue };
+                    let source = match name.as_str() {
+                        "web_fetch" | "agent" => Provenance::Web,
+                        "github" => Provenance::Github,
+                        n if n.starts_with("mcp") => Provenance::Mcp,
+                        n if n.starts_with("mesh") || n == "chat_read" => Provenance::Mesh,
+                        "herdr" => Provenance::Herdr,
+                        _ => continue,
+                    };
+                    if !sources.contains(&source) {
+                        sources.push(source);
+                    }
+                }
+                sources
+            }
+        };
+        for source in self.taint_shown() {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+        sources
+    }
+
+    /// The context budget the person set for this chat (runtime-kernel §11.2), or `None` for the default: also for a
+    /// saved value outside [`crate::config::context_budget_ok`] (a hand edit; a budget below
+    /// [`crate::config::MIN_COMPACT_TOKENS`] would compact every step and starve the chat, one past
+    /// [`crate::config::MAX_CONTEXT_BUDGET`] would never compact a model whose window isn't known).
+    pub fn context_budget(&self) -> Option<u64> {
+        self.context_budget.filter(|b| crate::config::context_budget_ok(*b))
+    }
+
+    /// Whether the conversation read another chat (runtime-kernel §9.2): saved so, or a `chat_read` result still in it.
+    pub fn read_chat(&self) -> bool {
+        self.read_chat
+            || (self.read_teams.is_empty()
+                && self.conversation.iter().any(|t| matches!(t, marv_core::ChatTurn::Tool { name, .. } if name == "chat_read")))
+    }
+
+    /// The outside sources the conversation's own calls show it read, whatever the file says: a github call, a bash
+    /// command with the network (`"network": true`, or on the host: `"sandbox": false`), a background process started
+    /// with the network.
+    pub fn taint_shown(&self) -> Vec<marv_core::Provenance> {
+        use marv_core::Provenance;
+        let mut shown = Vec::new();
+        for turn in &self.conversation {
+            let marv_core::ChatTurn::Assistant { tool_calls, .. } = turn else { continue };
+            for call in tool_calls {
+                let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+                let flag = |key: &str| args.get(key).and_then(serde_json::Value::as_bool);
+                let source = match call.name.as_str() {
+                    "github" => Some(Provenance::Github),
+                    "bash" if flag("network") == Some(true) || flag("sandbox") == Some(false) => Some(Provenance::Network),
+                    "process"
+                        if args.get("action").and_then(serde_json::Value::as_str) == Some("start")
+                            && flag("network") == Some(true) =>
+                    {
+                        Some(Provenance::Network)
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source.filter(|s| !shown.contains(s)) {
+                    shown.push(source);
+                }
+            }
+        }
+        shown
+    }
+
+    /// The saved plan, or `None` for none, an old file or a hand edit (the plan is dropped, the session still loads).
+    pub fn plan_items(&self) -> Option<Vec<marv_tools::PlanItem>> {
+        let items: Vec<marv_tools::PlanItem> = serde_json::from_value(self.plan.clone()?).ok()?;
+        (!items.is_empty()).then_some(items)
+    }
+
+    /// The conversation's MCP listing, or `None` for an old file or a hand edit (then nothing counts as announced).
+    pub fn mcp_listing(&self) -> Option<McpListing> {
+        self.mcp.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// The checkpoint chain and reported paths, or `None` for an old file or a hand edit (a chain id that isn't
+    /// `[\w.-]+`, a turn that isn't a positive whole number).
+    pub fn saved_checkpoints(&self) -> Option<SavedCheckpoints> {
+        let saved: SavedCheckpoints = serde_json::from_value(self.checkpoints.clone()?).ok()?;
+        let id_ok =
+            !saved.chain.is_empty() && saved.chain.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+        (id_ok && saved.reported.iter().all(|(turn, _)| *turn > 0)).then_some(saved)
+    }
+
+    /// The undo note not yet sent, or `None` (absent, empty, or not a string).
+    pub fn pending_note(&self) -> Option<String> {
+        self.pending_note.as_ref().and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub updated_at: u64,
+    pub messages: usize,
+    pub model: String,
+}
+
+/// `2026-10-13T08-05-09-042Z-abc123`: sorts by time, and is a safe file name.
+pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> SavedSession {
+    let id = format!("{}-{}", crate::time::iso(now_ms).replace([':', '.'], "-"), &random_hex()[..6]);
+    SavedSession {
+        version: VERSION,
+        id,
+        root: root.to_string_lossy().into_owned(),
+        created_at: now_ms,
+        updated_at: now_ms,
+        provider: provider.into(),
+        model: model.into(),
+        conversation: Vec::new(),
+        transcript: Vec::new(),
+        totals: Totals::default(),
+        mcp: None,
+        plan: None,
+        checkpoints: None,
+        pending_note: None,
+        taint: None,
+        radio_requests: None,
+        read_chat: false,
+        read_teams: Vec::new(),
+        summary: None,
+        summary_v2: false,
+        cut_off: None,
+        pid: None,
+        context_budget: None,
+        role: None,
+    }
+}
+
+/// Marv's line that says who woke a turn (`mesh::WakeBy::line`).
+const WOKEN_PREFIX: &str = "Woken by a message from ";
+
+/// The first user message, on one line, at most 56 characters. A chat only a wake started (no user message) takes
+/// Marv's line that says who woke it ("Woken by a message from …"), else its first notice.
+pub fn title_of(session: &SavedSession) -> String {
+    let first = session
+        .transcript
+        .iter()
+        .find(|m| m.role == Role::User)
+        .or_else(|| session.transcript.iter().find(|m| m.role == Role::System && m.text.starts_with(WOKEN_PREFIX)))
+        .or_else(|| session.transcript.iter().find(|m| m.role == Role::System))
+        .map_or("(empty)", |m| m.text.as_str());
+    let line = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > TITLE_CHARS {
+        format!("{}…", line.chars().take(TITLE_CHARS - 1).collect::<String>().trim_end())
+    } else {
+        line
+    }
+}
+
+/// A saved conversation's chat card (runtime-kernel chat card): its person messages only (`Role::User`), as of its
+/// last save. What a sleeping desktop chat shows before its session is loaded. No model call.
+pub fn card_of(session: &SavedSession) -> marv_kernel::Card {
+    let person = session.transcript.iter().filter(|m| m.role == Role::User).map(|m| m.text.as_str());
+    marv_mesh::card::person_card(person, session.updated_at)
+}
+
+/// "just now", "5 minutes ago", "yesterday", "3 days ago".
+pub fn time_ago(then: u64, now: u64) -> String {
+    let minutes = now.saturating_sub(then) / 60_000;
+    if minutes < 1 {
+        return "just now".into();
+    }
+    if minutes < 60 {
+        return format!("{minutes} minute{} ago", if minutes == 1 { "" } else { "s" });
+    }
+    let hours = (minutes as f64 / 60.0).round() as u64;
+    if hours < 24 {
+        return format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" });
+    }
+    let days = (hours as f64 / 24.0).round() as u64;
+    if days == 1 { "yesterday".into() } else { format!("{days} days ago") }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionStore {
+    pub dir: PathBuf,
+    /// marv-rs #212: this store has saved once (making its folders as needed). From then on a save makes only the
+    /// project's folder, inside a store folder that still exists: a save that lands late (a session dropped without
+    /// `close()`, or its folders removed meanwhile) fails instead of making the tree again.
+    made: Arc<std::sync::atomic::AtomicBool>,
+    /// The nearest folder at or above `dir` that existed when the store was made: the first save makes its folders
+    /// below this one only. A first save that landed after a test removed the store's folder made the whole tree
+    /// again (`write_private` makes every missing parent), and CI's leftover-folder check failed on it.
+    first_anchor: Option<PathBuf>,
+}
+
+impl SessionStore {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let first_anchor = dir.ancestors().find(|a| !a.as_os_str().is_empty() && a.is_dir()).map(Path::to_path_buf);
+        Self { dir, made: Arc::default(), first_anchor }
+    }
+
+    fn folder(&self, root: &Path) -> PathBuf {
+        self.dir.join(project_key(root))
+    }
+
+    /// Shared by colliding projects, so each session's root is checked.
+    fn legacy_folder(&self, root: &Path) -> PathBuf {
+        self.dir.join(legacy_project_key(root))
+    }
+
+    /// Where a session is (or will be, once it has had a turn) saved.
+    pub fn file(&self, root: &Path, id: &str) -> PathBuf {
+        self.folder(root).join(format!("{id}.json"))
+    }
+
+    /// Saves (or overwrites) a session. A session that has had no turn yet isn't saved: no user message, no reply
+    /// and no request. A chat that only ever ran turns a mesh message woke has no user message, but its history and
+    /// cost are worth keeping.
+    pub async fn save(&self, session: &SavedSession) -> std::io::Result<()> {
+        let had_a_turn =
+            session.transcript.iter().any(|m| matches!(m.role, Role::User | Role::Assistant)) || session.totals.requests > 0;
+        if !had_a_turn {
+            return Ok(());
+        }
+        let root = PathBuf::from(&session.root);
+        let stamped = SavedSession { updated_at: crate::time::now_ms(), ..session.clone() };
+        let text = serde_json::to_string(&stamped).map_err(std::io::Error::other)?;
+        let file = self.file(&root, &session.id);
+        if self.made.load(std::sync::atomic::Ordering::SeqCst) {
+            write_private_under(&self.dir, &file, &text).await?;
+        } else {
+            match &self.first_anchor {
+                Some(anchor) => write_private_under(anchor, &file, &text).await?,
+                None => write_private(&file, &text).await?,
+            }
+            self.made.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Saved under the old key before: it lives in the new folder from now on.
+        let _ = tokio::fs::remove_file(self.legacy_folder(&root).join(format!("{}.json", session.id))).await;
+        Ok(())
+    }
+
+    /// Deletes a saved session and its saved pages (#63: a swap folder never outlives its session).
+    pub async fn remove(&self, root: &Path, id: &str) -> std::io::Result<()> {
+        let file = self.file(root, id);
+        let swap = marv_tools::swap::swap_dir(&file);
+        if std::fs::symlink_metadata(&swap).is_ok_and(|m| m.is_dir()) {
+            tokio::fs::remove_dir_all(&swap).await?;
+        }
+        match tokio::fs::remove_file(&file).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn load(&self, root: &Path, id: &str) -> Option<SavedSession> {
+        match Self::read(&self.file(root, id), root).await {
+            Some(s) => Some(s),
+            None => Self::read(&self.legacy_folder(root).join(format!("{id}.json")), root).await,
+        }
+    }
+
+    /// A session file of this project: `None` when missing, damaged, an old format, or another project's.
+    async fn read(file: &Path, root: &Path) -> Option<SavedSession> {
+        let text = tokio::fs::read_to_string(file).await.ok()?;
+        let session: SavedSession = serde_json::from_str(&text).ok()?;
+        (session.version == VERSION && Path::new(&session.root) == root).then_some(session)
+    }
+
+    /// This project's sessions, newest first (a tie in the same millisecond: the one started later first, #42).
+    pub async fn list(&self, root: &Path) -> Vec<SessionSummary> {
+        self.sorted(root)
+            .await
+            .iter()
+            .map(|s| SessionSummary {
+                id: s.id.clone(),
+                title: title_of(s),
+                updated_at: s.updated_at,
+                messages: s.transcript.iter().filter(|m| matches!(m.role, Role::User | Role::Assistant)).count(),
+                model: s.model.clone(),
+            })
+            .collect()
+    }
+
+    /// This project's sessions in full, newest first.
+    async fn sorted(&self, root: &Path) -> Vec<SavedSession> {
+        let mut ids = std::collections::BTreeSet::new();
+        for folder in [self.folder(root), self.legacy_folder(root)] {
+            let Ok(mut entries) = tokio::fs::read_dir(&folder).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(id) = entry.file_name().to_string_lossy().strip_suffix(".json") {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+        let mut sessions = Vec::new();
+        for id in ids {
+            if let Some(s) = self.load(root, &id).await {
+                sessions.push(s);
+            }
+        }
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.created_at.cmp(&a.created_at)));
+        sessions
+    }
+
+    /// The newest chat the person took part in (`marv -c`, `/resume` of the latest): one only mesh wakes ran, with no
+    /// message of theirs, is left out, so continuing picks up the chat they last typed in.
+    pub async fn latest(&self, root: &Path) -> Option<SavedSession> {
+        self.sorted(root).await.into_iter().find(|s| s.transcript.iter().any(|m| m.role == Role::User))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_user(root: &Path, text: &str, at: u64) -> SavedSession {
+        let mut s = new_session(root, "openrouter", "m", at);
+        s.transcript.push(Message::new(1, Role::User, text));
+        s
+    }
+
+    /// Runtime-kernel chat card: a saved conversation's card (a sleeping desktop chat's) is its person messages only,
+    /// as of its last save.
+    #[test]
+    fn a_saved_conversations_card_is_its_person_messages() {
+        let mut s = with_user(Path::new("/p"), "Set up the Rust API skeleton", 1);
+        s.transcript.push(Message::new(2, Role::Assistant, "MODEL REPLY"));
+        s.transcript.push(Message::new(3, Role::System, "Woken by a message from worker-1 on agent.parent.inbox"));
+        s.transcript.push(Message::new(4, Role::Tool, "TOOL OUTPUT"));
+        s.transcript.push(Message::new(5, Role::User, "add auth\tmiddleware"));
+        s.transcript.push(Message::new(6, Role::System, "Woken by a message from peer-x on agent.parent.inbox"));
+        s.updated_at = 42;
+        let card = card_of(&s);
+        assert_eq!(
+            card,
+            marv_kernel::Card {
+                title: "Set up the Rust API skeleton".into(),
+                now: "add auth middleware".into(),
+                last_active_ms: 42,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saves_lists_and_loads_privately_and_skips_damaged_files() {
+        let dir = std::env::temp_dir().join(format!("marv-sessions-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(&dir);
+        let root = Path::new("/home/me/proj");
+        let s = with_user(root, "fix   the\nbug", 1);
+        store.save(&s).await.unwrap();
+        store.save(&new_session(root, "openrouter", "m", 2)).await.unwrap(); // nothing in it: not saved
+        let mut notice_only = new_session(root, "openrouter", "m", 3);
+        notice_only.transcript.push(Message::new(1, Role::System, "a notice"));
+        store.save(&notice_only).await.unwrap(); // no turn yet: not saved
+        tokio::fs::write(store.file(root, "broken"), "{").await.unwrap();
+        let list = store.list(root).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "fix the bug");
+        assert_eq!(store.latest(root).await.unwrap().id, s.id);
+        assert!(store.latest(Path::new("/nowhere")).await.is_none());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(store.file(root, &s.id)).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chat_that_only_ran_woken_turns_is_saved_and_titled_by_the_wake() {
+        let dir = std::env::temp_dir().join(format!("marv-sessions-woken-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(&dir);
+        let root = Path::new("/home/me/proj");
+        let mut woken = new_session(root, "openrouter", "m", 1);
+        woken.transcript.push(Message::new(1, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        woken.transcript.push(Message::new(2, Role::Assistant, "Merged."));
+        woken.totals.requests = 2;
+        store.save(&woken).await.unwrap();
+        // Only its cost survived (a turn that ended before any text): still kept.
+        let mut costed = new_session(root, "openrouter", "m", 2);
+        costed.transcript.push(Message::new(1, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        costed.totals.requests = 1;
+        store.save(&costed).await.unwrap();
+        let list = store.list(root).await;
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|s| s.title == "Woken by a message from worker on agent.parent.inbox"), "{list:?}");
+        assert_eq!(store.load(root, &woken.id).await.unwrap().totals.requests, 2);
+        // `marv -c` skips them: with only woken chats there is nothing of the person's to continue.
+        assert!(store.latest(root).await.is_none());
+        let typed = with_user(root, "fix the bug", 0);
+        store.save(&typed).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let mut later = new_session(root, "openrouter", "m", 5);
+        later.transcript.push(Message::new(1, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        later.totals.requests = 1;
+        store.save(&later).await.unwrap();
+        assert_eq!(store.latest(root).await.unwrap().id, typed.id, "a newer woken chat is skipped");
+        // The title is the wake's line even after a notice (a resume, a radio note) came first.
+        let mut noted = new_session(root, "openrouter", "m", 3);
+        noted.transcript.push(Message::new(1, Role::System, "Resumed from an earlier chat"));
+        noted.transcript.push(Message::new(2, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        assert_eq!(title_of(&noted), "Woken by a message from worker on agent.parent.inbox");
+        let mut only_notice = new_session(root, "openrouter", "m", 4);
+        only_notice.transcript.push(Message::new(1, Role::System, "Resumed from an earlier chat"));
+        assert_eq!(title_of(&only_notice), "Resumed from an earlier chat");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_removes_its_saved_pages() {
+        let dir = std::env::temp_dir().join(format!("marv-sessions-rm-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(&dir);
+        let root = Path::new("/tmp/project-rm");
+        let session = with_user(root, "hi", 1);
+        store.save(&session).await.unwrap();
+        let swap = marv_tools::swap::swap_dir(&store.file(root, &session.id));
+        std::fs::create_dir_all(&swap).unwrap();
+        std::fs::write(swap.join("1.jsonl"), "{}").unwrap();
+        std::fs::create_dir_all(swap.join("tmp")).unwrap(); // the chat's /tmp (marv_tools::swap::scratch_dir)
+        std::fs::write(swap.join("tmp/err.txt"), "x").unwrap();
+        store.remove(root, &session.id).await.unwrap();
+        assert!(!swap.exists() && !store.file(root, &session.id).exists());
+        store.remove(root, &session.id).await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #212's CI: a save landing after the store's folder was removed fails and makes nothing again; another
+    // project's folder inside a store that's still there is made.
+    #[tokio::test]
+    async fn a_late_save_never_makes_the_store_again() {
+        let base = std::env::temp_dir().join(format!("marv-sessions-late-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(base.join("store"));
+        store.save(&with_user(Path::new("/home/me/proj"), "hi", 1)).await.unwrap();
+        store.save(&with_user(Path::new("/home/me/other"), "hi", 2)).await.unwrap();
+        assert!(store.file(Path::new("/home/me/other"), "x").parent().unwrap().is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(store.save(&with_user(Path::new("/home/me/proj"), "late", 3)).await.is_err());
+        assert!(!base.exists());
+    }
+
+    // The same for a store's first save: one landing after its folder was removed (a test's cleanup ran first) fails
+    // and makes nothing again; a store whose folder doesn't exist yet still makes it on its first save.
+    #[tokio::test]
+    async fn a_late_first_save_never_makes_the_store_again() {
+        let base = std::env::temp_dir().join(format!("marv-sessions-first-{}-{}", std::process::id(), random_hex()));
+        std::fs::create_dir_all(base.join("store")).unwrap();
+        let store = SessionStore::new(base.join("store"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(store.save(&with_user(Path::new("/home/me/proj"), "late", 1)).await.is_err());
+        assert!(!base.exists());
+        let fresh = SessionStore::new(base.join("a/b/store"));
+        fresh.save(&with_user(Path::new("/home/me/proj"), "hi", 2)).await.unwrap();
+        assert!(base.join("a/b/store").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_saved_taint_gets_what_the_calls_show_added() {
+        use marv_core::{ChatTurn, Provenance, ToolCall};
+        let mut s = with_user(Path::new("/p"), "x", 0);
+        s.taint = Some(vec![]);
+        let call = |name: &str, args: &str| ToolCall { id: "c".into(), name: name.into(), arguments: args.into() };
+        s.conversation.push(ChatTurn::Assistant {
+            text: String::new(),
+            tool_calls: vec![call("bash", r#"{"command":"ls"}"#), call("read_file", r#"{"path":"a"}"#)],
+            reasoning: None,
+        });
+        assert!(s.taint_sources().is_empty(), "offline and local: nothing shown");
+        s.conversation.push(ChatTurn::Assistant {
+            text: String::new(),
+            tool_calls: vec![
+                call("bash", r#"{"command":"curl x","network":true}"#),
+                call("github", r#"{"args":["pr","view","1"]}"#),
+            ],
+            reasoning: None,
+        });
+        assert_eq!(s.taint_sources(), [Provenance::Network, Provenance::Github]);
+        s.taint = Some(vec![Provenance::Web]);
+        assert_eq!(s.taint_sources(), [Provenance::Web, Provenance::Network, Provenance::Github]);
+        let mut p = with_user(Path::new("/p"), "x", 0);
+        p.taint = Some(vec![]);
+        p.conversation.push(ChatTurn::Assistant {
+            text: String::new(),
+            tool_calls: vec![call("process", r#"{"action":"start","command":"npm i","network":true}"#)],
+            reasoning: None,
+        });
+        assert_eq!(p.taint_sources(), [Provenance::Network]);
+    }
+
+    #[test]
+    fn titles_and_times() {
+        let s = with_user(Path::new("/p"), &"word ".repeat(30), 0);
+        let t = title_of(&s);
+        assert!(t.ends_with('…') && t.chars().count() <= 56);
+        assert_eq!(time_ago(0, 30_000), "just now");
+        assert_eq!(time_ago(0, 60_000), "1 minute ago");
+        assert_eq!(time_ago(0, 3 * 3_600_000), "3 hours ago");
+        assert_eq!(time_ago(0, 30 * 3_600_000), "yesterday");
+        assert_eq!(time_ago(0, 72 * 3_600_000), "3 days ago");
+    }
+
+    #[test]
+    fn a_saved_plan_is_read_back_and_a_bad_or_empty_one_is_dropped() {
+        let mut s = new_session(Path::new("/p"), "x", "y", 1);
+        assert_eq!(s.plan_items(), None);
+        s.plan = Some(serde_json::json!([{ "text": "a", "status": "in_progress" }]));
+        let items = s.plan_items().unwrap();
+        assert_eq!(items[0].status, marv_tools::PlanStatus::InProgress);
+        s.plan = Some(serde_json::json!([{ "text": "x", "status": "started" }]));
+        assert_eq!(s.plan_items(), None);
+        s.plan = Some(serde_json::json!([]));
+        assert_eq!(s.plan_items(), None);
+        // Written only when there is one: older readers never see the key.
+        s.plan = None;
+        assert!(!serde_json::to_string(&s).unwrap().contains("\"plan\""));
+    }
+
+    #[test]
+    fn ids_are_file_safe_and_sortable() {
+        let s = new_session(Path::new("/p"), "x", "y", 1_791_878_709_042);
+        assert!(s.id.starts_with("2026-10-13T08-05-09-042Z-"));
+        assert!(!s.id.contains(':'));
+    }
+}

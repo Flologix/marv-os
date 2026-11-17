@@ -1,0 +1,1927 @@
+//! Slash commands, engine side. Ports Marv's `src/commands/index.ts` (and `sandbox-notice.ts`).
+//!
+//! Commands are handled locally and never reach the model. Each is a pure function returning a [`CommandAction`];
+//! the client (the TUI) applies it. That keeps this module free of UI and I/O, and easy to test. Add new commands to
+//! [`commands`]; they show up in the `/` menu automatically. A `/<skill>` runs that skill, but built-in names win.
+//! Text that quotes the project, a server or a check goes through `printable()`.
+//!
+//! Port note: `/sandbox`'s "is bubblewrap here?" is a field of [`CommandContext`] (`sandbox_available`), not a call,
+//! so every command stays pure.
+
+use marv_core::printable;
+use marv_mcp::config::ServerSource;
+use marv_mcp::manager::{McpServerStatus, McpState};
+
+use crate::agents::{AgentType, SUBAGENT_TOOLS};
+use crate::checks::{CHECKS_DIR, ProjectCheck, ProjectCheckResult};
+use crate::config::{Config, KeySource, Language, mask_key, preset};
+use crate::session::{CheckpointProblem, DiagnosticsInfo};
+use crate::skills::{LoadedSkill, SkillSource};
+use crate::usage::{Totals, usage_report};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemoryTarget {
+    Personal,
+    Project,
+}
+
+/// What `/compact budget …` asks (runtime-kernel §11.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetArg {
+    /// `/compact budget`: show it.
+    Show,
+    /// `/compact budget 60000` (`60_000`, `60,000` and `60k` too).
+    Set(u64),
+    /// `/compact budget default` (or `0`).
+    Default,
+}
+
+/// `/compact`'s arguments as a budget command: `budget` (any case) alone, or followed by one number or `default`.
+/// Anything else (`budget notes and the API`, `budgeting`) is a focus for the summary, as before.
+pub fn compact_budget(args: &str) -> Option<BudgetArg> {
+    let mut words = args.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("budget") {
+        return None;
+    }
+    let value = match (words.next(), words.next()) {
+        (None, _) => return Some(BudgetArg::Show),
+        (Some(value), None) => value,
+        _ => return None,
+    };
+    if value.eq_ignore_ascii_case("default") {
+        return Some(BudgetArg::Default);
+    }
+    let digits = value.replace(['_', ','], "");
+    let (digits, scale) = match digits.strip_suffix(['k', 'K']) {
+        Some(d) => (d.to_string(), 1_000),
+        None => (digits, 1),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    Some(if n == 0 { BudgetArg::Default } else { BudgetArg::Set(n) })
+}
+
+/// What Marv says about a chat's context budget (runtime-kernel §11.2): the budget in use (`None`: compaction off),
+/// whether it's the person's or the default, and, when the context already used is at or past it, that the next
+/// message compacts.
+pub fn context_budget_text(budget: Option<u64>, set: Option<u64>, used: Option<u64>) -> String {
+    let Some(budget) = budget else {
+        return "Context budget: none (compaction is off).".into();
+    };
+    let whose = match set {
+        Some(set) if set != budget => format!("yours, {set}, capped at 85% of the model's window"),
+        Some(_) => "yours".into(),
+        None => "the default".into(),
+    };
+    let mut text = format!("Context budget: {budget} tokens ({whose}).");
+    if let Some(used) = used.filter(|u| *u >= budget) {
+        text.push_str(&format!(" The context ({used} tokens) is already past it: Marv compacts at your next message."));
+    }
+    text
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandAction {
+    Print {
+        text: String,
+        is_error: bool,
+        markdown: bool,
+    },
+    Clear,
+    Setup,
+    /// With an id: switch straight to it. Without: open the model picker.
+    Model {
+        id: Option<String>,
+    },
+    Thinking {
+        on: bool,
+    },
+    Sandbox {
+        on: bool,
+    },
+    Yolo {
+        on: bool,
+    },
+    Trajectories {
+        on: bool,
+    },
+    /// `/diagnostics on|off` (`language` `None`: every language) or `/diagnostics <language> on|off` (#187).
+    Diagnostics {
+        language: Option<Language>,
+        on: bool,
+    },
+    /// `/diagnostics clear` (#187): delete this project's check cache folder.
+    ClearCheckCache,
+    Checks {
+        on: bool,
+    },
+    Checkpoints {
+        on: bool,
+    },
+    /// Show the last turn's changes and, on a yes, put its files back (#16).
+    Undo,
+    /// The step limit: set it (0 never asks). Showing it is a `Print`.
+    Steps {
+        every: u32,
+    },
+    McpTrust,
+    /// `/trust`: use the project's instruction files, skills and agent types as the person's own
+    /// (`crate::project_trust`), from the next start.
+    TrustProject,
+    McpAdd {
+        args: String,
+    },
+    McpSearch {
+        words: String,
+    },
+    McpRemove {
+        name: String,
+    },
+    McpLogin {
+        server: String,
+    },
+    McpLogout {
+        server: String,
+    },
+    /// Rate or tag the last turn: 1 good, -1 bad, 0 labels only.
+    Feedback {
+        score: i8,
+        note: Option<String>,
+        labels: Option<Vec<String>>,
+    },
+    Resume,
+    Remember {
+        scope: MemoryTarget,
+        text: String,
+    },
+    Forget {
+        text: String,
+    },
+    Memory,
+    Compact {
+        focus: Option<String>,
+    },
+    /// Runtime-kernel §11.2: `/compact budget [<tokens>|default]`, this chat's context budget (shown, set, or back to
+    /// the default). The person's command: a model's or the mesh's text never runs a command.
+    CompactBudget {
+        budget: BudgetArg,
+    },
+    /// marv-rs #78: let a message on a wired inbox start a turn while idle (`mesh.wake`). Showing it is a `Print`.
+    /// `None` (runtime-kernel live UX: `/mesh wake rules`) is the default again: only rules' wires wake.
+    MeshWake {
+        wake: Option<bool>,
+    },
+    /// marv-rs #124: put this Marv on the mesh radio, or take it off (`mesh.radio` in the user's own config, and join
+    /// or leave at once).
+    Radio {
+        on: bool,
+    },
+    /// `/radio` with the radio on: the view of who's on it.
+    RadioView,
+    /// Runtime-kernel §19: `/board`, the team boards of the rules covering this Marv (`crate::board::person_view`).
+    Board,
+    /// marv-rs #124: `/tx [@name…] text`, the person's message on the radio (`by: user`); no `@name` is everyone.
+    /// Nothing of it reaches this Marv's own model.
+    Tx {
+        to: Vec<String>,
+        text: String,
+    },
+    /// marv-rs #124 (phase 3): `/ask @name text`, the person's request on the radio (`by: user`, hop 0): one Marv,
+    /// which acknowledges and reports `done` or `failed` when the turn that handled it ends. Nothing of it reaches
+    /// this Marv's own model; the reports do, fenced, at its next turn.
+    Ask {
+        to: String,
+        text: String,
+    },
+    /// Stop one of the session's background processes (Marv #51).
+    Processes {
+        stop: String,
+    },
+    /// marv-rs #74: the panes the Herdr door opened. Neither set: list them; `read`: a peer's last lines; `stop`: ask
+    /// it to leave and close its pane (its worktree stays).
+    Peers {
+        read: Option<String>,
+        stop: Option<String>,
+    },
+    /// The user ran a skill: `/<name> <args>`.
+    Skill {
+        name: String,
+        args: String,
+    },
+    Exit,
+}
+
+fn print(text: impl Into<String>) -> CommandAction {
+    CommandAction::Print { text: text.into(), is_error: false, markdown: false }
+}
+fn markdown(text: impl Into<String>) -> CommandAction {
+    CommandAction::Print { text: text.into(), is_error: false, markdown: true }
+}
+fn error(text: impl Into<String>) -> CommandAction {
+    CommandAction::Print { text: text.into(), is_error: true, markdown: false }
+}
+
+/// The mesh as `/mesh` shows it (marv-rs): who this Marv is on it and what's wired to its inbox.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MeshStatus {
+    /// Its name on the machine's mesh (others reach it at `peer.<name>.agent.parent.inbox`), when its door is open.
+    pub name: Option<String>,
+    /// The wires into the main agent's inbox, as `from -> receptacle`: the only messages that can wake it.
+    pub wired: Vec<String>,
+}
+
+/// Read-only facts a command may need.
+#[derive(Debug, Clone)]
+pub struct CommandContext<'a> {
+    pub config: &'a Config,
+    pub config_path: String,
+    pub skills: &'a [LoadedSkill],
+    pub agents: &'a [AgentType],
+    pub agent_problems: &'a [String],
+    pub skill_problems: &'a [String],
+    /// MCP servers as they are now, and config problems.
+    pub mcp: Option<(&'a [McpServerStatus], &'a [String])>,
+    pub trajectories_path: Option<String>,
+    /// Totals, the last request, the context window.
+    pub usage: Option<(&'a Totals, Option<&'a marv_core::Usage>, Option<u64>)>,
+    /// Runtime-kernel §16.9: the folder's day (every chat in it, today), when this Marv meters (`/cost` adds it).
+    pub folder_day: Option<String>,
+    /// The project's checks on disk, problems, the session's last pass.
+    pub checks: Option<(&'a [ProjectCheck], &'a [String], Option<&'a ProjectCheckResult>)>,
+    /// Why the last checkpoint failed, or why checkpoints are off for this project, for /checkpoints.
+    pub checkpoints: Option<&'a CheckpointProblem>,
+    /// PATH folders under the home folder the sandbox can't see, shortened for display.
+    pub hidden_path_folders: &'a [String],
+    pub sandbox_available: bool,
+    /// The session's background processes, for /processes; None when the session doesn't offer the process tool.
+    pub processes: Option<&'a [marv_tools::ProcessInfo]>,
+    /// The session's switchboard as `/mesh` shows it; None when this Marv isn't on the mesh.
+    pub mesh: Option<&'a MeshStatus>,
+    /// The session's grants for `/permissions` (#82); None: the client has none to show.
+    pub permissions: Option<&'a crate::permissions::Permissions>,
+    /// The chat's role (`crate::roles`), for `/role`; None: it has none.
+    pub role: Option<&'a crate::roles::Role>,
+    /// The diagnostics checkers' states and this project's check cache, for `/diagnostics` (#187).
+    pub diagnostics: Option<&'a DiagnosticsInfo>,
+}
+
+pub struct Command {
+    pub name: &'static str,
+    /// The ctrl+k palette may run it while a reply streams (#44): it only shows something, or changes a setting from
+    /// the next turn on ([`crate::MarvSession::configure`]). Anything that starts a turn, opens a picker, touches the
+    /// conversation or the files waits for an idle session. Decide it for each new command.
+    pub while_busy: bool,
+    pub description: &'static str,
+    pub run: fn(&str, &CommandContext) -> CommandAction,
+}
+
+fn on_off(args: &str, usage: &str) -> Result<Option<bool>, CommandAction> {
+    match args.to_lowercase().as_str() {
+        "" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        _ => Err(error(usage)),
+    }
+}
+
+/// Every built-in command, in `/help` order.
+pub fn commands() -> &'static [Command] {
+    static COMMANDS: &[Command] = &[
+        Command { name: "help", while_busy: true, description: "Show available commands", run: |_, _| print(help_text()) },
+        Command {
+            name: "config",
+            while_busy: true,
+            description: "Show the current configuration",
+            run: |_, ctx| print(config_text(ctx)),
+        },
+        Command {
+            name: "setup",
+            while_busy: false,
+            description: "Change provider, model, or API key",
+            run: |_, _| CommandAction::Setup,
+        },
+        Command {
+            name: "model",
+            while_busy: false,
+            description: "Switch model (/model to pick, /model <id> to set)",
+            run: |args, _| CommandAction::Model { id: (!args.is_empty()).then(|| args.to_string()) },
+        },
+        Command {
+            name: "think",
+            while_busy: true,
+            description: "Toggle model thinking (/think on, /think off)",
+            run: |args, ctx| match on_off(args, "Usage: /think, /think on, or /think off") {
+                Ok(on) => CommandAction::Thinking { on: on.unwrap_or(!ctx.config.thinking) },
+                Err(e) => e,
+            },
+        },
+        Command { name: "memory", while_busy: true, description: "Show what Marv remembers", run: |_, _| CommandAction::Memory },
+        Command {
+            name: "remember",
+            while_busy: false,
+            description: "Save a note to memory (/remember <note>, or /remember project: <note>)",
+            run: |args, _| {
+                let lower = args.to_lowercase();
+                let (scope, text) = match lower.strip_prefix("project:") {
+                    Some(_) => (MemoryTarget::Project, args["project:".len()..].trim_start()),
+                    None => (MemoryTarget::Personal, args),
+                };
+                if text.trim().is_empty() {
+                    return error("Usage: /remember <note> (personal), or /remember project: <note>");
+                }
+                CommandAction::Remember { scope, text: text.to_string() }
+            },
+        },
+        Command {
+            name: "forget",
+            while_busy: false,
+            description: "Remove a memory (/forget <text from it>)",
+            run: |args, _| {
+                if args.trim().is_empty() {
+                    error("Usage: /forget <text from the memory>")
+                } else {
+                    CommandAction::Forget { text: args.into() }
+                }
+            },
+        },
+        Command {
+            name: "compact",
+            while_busy: false,
+            description: "Summarize the conversation to free up context (/compact <what to keep>; /compact budget <tokens>|default)",
+            run: |args, _| match compact_budget(args) {
+                Some(budget) => CommandAction::CompactBudget { budget },
+                None => CommandAction::Compact { focus: (!args.is_empty()).then(|| args.to_string()) },
+            },
+        },
+        Command {
+            name: "resume",
+            while_busy: false,
+            description: "Pick up an earlier session in this project",
+            run: |_, _| CommandAction::Resume,
+        },
+        Command {
+            name: "cost",
+            while_busy: true,
+            description: "Show tokens used and cost so far",
+            run: |_, ctx| {
+                let session = ctx
+                    .usage
+                    .map_or_else(|| "No requests yet this session.".to_string(), |(t, last, c)| usage_report(t, last, c));
+                print(match &ctx.folder_day {
+                    Some(day) => format!("{session}\n{day}"),
+                    None => session,
+                })
+            },
+        },
+        Command {
+            name: "agents",
+            while_busy: true,
+            description: "List the subagent types Marv can start",
+            run: |_, ctx| markdown(agents_text(ctx.agents, ctx.agent_problems)),
+        },
+        Command {
+            name: "role",
+            while_busy: true,
+            description: "Show this chat's role (fixed when the chat started)",
+            run: |_, ctx| print(role_text(ctx.role)),
+        },
+        Command {
+            name: "skills",
+            while_busy: true,
+            description: "List the skills Marv can use",
+            run: |_, ctx| markdown(skills_text(ctx.skills, ctx.skill_problems)),
+        },
+        Command {
+            name: "sandbox",
+            while_busy: true,
+            description: "Show or set the bash sandbox (/sandbox on, /sandbox off)",
+            run: |args, ctx| match on_off(args, "Usage: /sandbox, /sandbox on, or /sandbox off") {
+                Ok(Some(on)) => CommandAction::Sandbox { on },
+                Ok(None) => {
+                    print(format!("Sandbox: {}", sandbox_status(ctx.config, ctx.sandbox_available, ctx.hidden_path_folders)))
+                }
+                Err(e) => e,
+            },
+        },
+        Command {
+            name: "yolo",
+            while_busy: true,
+            description: "Run edits and sandboxed commands without asking (/yolo on; /yolo off asks for all, unless approveSandboxed is set)",
+            run: |args, ctx| match on_off(args, "Usage: /yolo, /yolo on, or /yolo off") {
+                Ok(on) => CommandAction::Yolo { on: on.unwrap_or(!ctx.config.yolo) },
+                Err(e) => e,
+            },
+        },
+        Command {
+            name: "permissions",
+            // Only shows: the palette may run it while a reply streams.
+            while_busy: true,
+            description: "What Marv may do without asking: this session's approvals, and what's saved",
+            run: |args, ctx| {
+                if !args.trim().is_empty() {
+                    return error(crate::permissions::PERMISSIONS_USAGE);
+                }
+                match ctx.permissions {
+                    None => print("Permissions aren't available here."),
+                    Some(p) => {
+                        let saved = crate::permissions::SavedGrants {
+                            path: &ctx.config_path,
+                            approve: &ctx.config.approve,
+                            writable: &ctx.config.writable,
+                        };
+                        markdown(crate::permissions::permissions_text(p, Some(saved), ctx.mcp.map(|m| m.0)))
+                    }
+                }
+            },
+        },
+        Command {
+            name: "mcp",
+            while_busy: false,
+            description: "Show MCP servers and their tools (/mcp add <package | URL | repo>, search, remove, trust, login, logout)",
+            run: |args, ctx| mcp_command(args.trim(), ctx),
+        },
+        Command {
+            name: "good",
+            while_busy: false,
+            description: "Rate the last turn as good (/good <optional note>)",
+            run: |args, _| CommandAction::Feedback {
+                score: 1,
+                note: Some(args.trim().to_string()).filter(|n| !n.is_empty()),
+                labels: None,
+            },
+        },
+        Command {
+            name: "bad",
+            while_busy: false,
+            description: "Rate the last turn as bad (/bad <what went wrong>)",
+            run: |args, _| CommandAction::Feedback {
+                score: -1,
+                note: Some(args.trim().to_string()).filter(|n| !n.is_empty()),
+                labels: None,
+            },
+        },
+        Command {
+            name: "label",
+            while_busy: false,
+            description: "Tag the last turn (/label refactor, tests)",
+            run: |args, _| {
+                let labels: Vec<String> =
+                    args.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).map(String::from).collect();
+                if labels.is_empty() {
+                    error("Usage: /label <tag> [more tags]")
+                } else {
+                    CommandAction::Feedback { score: 0, note: None, labels: Some(labels) }
+                }
+            },
+        },
+        Command {
+            name: "trajectories",
+            while_busy: false,
+            description: "Show or set run logging (/trajectories on, /trajectories off)",
+            run: |args, ctx| match on_off(args, "Usage: /trajectories, /trajectories on, or /trajectories off") {
+                Ok(Some(on)) => CommandAction::Trajectories { on },
+                Ok(None) => print(format!("Trajectories: {}", trajectories_status(ctx.config, ctx.trajectories_path.as_deref()))),
+                Err(e) => e,
+            },
+        },
+        Command {
+            name: "checks",
+            while_busy: true,
+            description: "The project's checks from .marv/checks/ and their last result (/checks on, /checks off)",
+            run: |args, ctx| match on_off(args, "Usage: /checks, /checks on, or /checks off") {
+                Ok(Some(on)) => CommandAction::Checks { on },
+                Ok(None) => markdown(checks_text(ctx)),
+                Err(e) => e,
+            },
+        },
+        Command {
+            name: "processes",
+            while_busy: true,
+            description: "Background processes the model started (/processes stop <name>)",
+            run: |args, ctx| {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                match words[..] {
+                    ["stop", name] => return CommandAction::Processes { stop: name.to_string() },
+                    [] => {}
+                    _ => return error("Usage: /processes, or /processes stop <name>"),
+                }
+                match ctx.processes {
+                    None => print("Background processes aren't available here: they need the bubblewrap sandbox."),
+                    Some([]) => print(
+                        "No background processes. The model starts one with the process tool (a dev server, a watcher), and you're asked first.",
+                    ),
+                    Some(list) => {
+                        let now = marv_tools::process::now_ms();
+                        print(
+                            list.iter()
+                                .map(|p| printable(&marv_tools::process::process_line(p, now)))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    }
+                }
+            },
+        },
+        Command {
+            name: "peers",
+            while_busy: true,
+            description: "Herdr panes and workers the model opened (/peers read <name>, /peers stop <name>)",
+            run: |args, _ctx| {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                match words[..] {
+                    [] => CommandAction::Peers { read: None, stop: None },
+                    ["read", name] => CommandAction::Peers { read: Some(name.to_string()), stop: None },
+                    ["stop", name] => CommandAction::Peers { read: None, stop: Some(name.to_string()) },
+                    _ => error("Usage: /peers, /peers read <name>, or /peers stop <name>"),
+                }
+            },
+        },
+        Command {
+            name: "mesh",
+            // Shows the wires, or turns wake on/off: wake only acts on an idle session, so the palette may run it.
+            while_busy: true,
+            description: "The mesh: what's wired to Marv's inbox (/mesh wake on lets a message start a turn while idle)",
+            run: |args, ctx| {
+                let words: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                match words[..] {
+                    [] => markdown(mesh_text(ctx)),
+                    ["wake", "on"] => CommandAction::MeshWake { wake: Some(true) },
+                    ["wake", "off"] => CommandAction::MeshWake { wake: Some(false) },
+                    ["wake", "rules"] => CommandAction::MeshWake { wake: None },
+                    ["wake"] => print(format!("Mesh wake: {}", mesh_wake_status(ctx.config))),
+                    _ => error("Usage: /mesh, /mesh wake, /mesh wake on, /mesh wake rules, or /mesh wake off"),
+                }
+            },
+        },
+        Command {
+            name: "radio",
+            // Joining or leaving doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "The mesh radio: who of your Marvs here is up, and what they said (/radio on, /radio off)",
+            run: |args, ctx| match on_off(args.trim(), "Usage: /radio, /radio on, or /radio off") {
+                Err(usage) => usage,
+                Ok(Some(on)) => CommandAction::Radio { on },
+                Ok(None) if ctx.config.mesh_radio => CommandAction::RadioView,
+                Ok(None) => print(RADIO_OFF),
+            },
+        },
+        Command {
+            name: "board",
+            // Reading the board doesn't touch a running turn.
+            while_busy: true,
+            description: "The team board of each rule covering this Marv: who's on what, notes, what's done",
+            run: |args, _ctx| match args.trim() {
+                "" => CommandAction::Board,
+                _ => error("Usage: /board"),
+            },
+        },
+        Command {
+            name: "tx",
+            // Sending doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "Say something on the mesh radio: /tx @name text, or /tx text for every Marv on it",
+            run: |args, ctx| {
+                if !ctx.config.mesh_radio {
+                    return print(RADIO_OFF);
+                }
+                match parse_tx(args) {
+                    Some((to, text)) => CommandAction::Tx { to, text },
+                    None => error("Usage: /tx @name text (one Marv; several: @a @b), or /tx text (every Marv on the radio)"),
+                }
+            },
+        },
+        Command {
+            name: "ask",
+            // Sending doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "Ask another Marv on the radio to do something: /ask @name text (it acknowledges, then reports back)",
+            run: |args, ctx| {
+                if !ctx.config.mesh_radio {
+                    return print(RADIO_OFF);
+                }
+                match parse_tx(args) {
+                    Some((to, text)) if to.len() == 1 => CommandAction::Ask { to: to[0].clone(), text },
+                    _ => error("Usage: /ask @name text (a request goes to exactly one Marv on the radio)"),
+                }
+            },
+        },
+        Command {
+            name: "undo",
+            while_busy: false,
+            description: "Put back the files the last turn changed (shows them first)",
+            run: |args, _| {
+                if args.trim().is_empty() {
+                    CommandAction::Undo
+                } else {
+                    error("Usage: /undo (it takes back the last turn not yet undone; again for the one before)")
+                }
+            },
+        },
+        Command {
+            name: "checkpoints",
+            while_busy: false,
+            description: "Snapshots before each turn's changes, for /undo (/checkpoints on, /checkpoints off)",
+            run: |args, ctx| match on_off(args, "Usage: /checkpoints, /checkpoints on, or /checkpoints off") {
+                Ok(Some(on)) => CommandAction::Checkpoints { on },
+                Ok(None) => {
+                    let problem = match ctx.checkpoints {
+                        Some(CheckpointProblem { off: Some(off), .. }) => format!("\nOff for this project: {}.", printable(off)),
+                        Some(CheckpointProblem { failure: Some(failure), .. }) => {
+                            format!("\nThe last checkpoint failed: {}", printable(failure))
+                        }
+                        _ => String::new(),
+                    };
+                    let problem = if ctx.config.checkpoints { problem } else { String::new() };
+                    print(format!("Checkpoints: {}{problem}", checkpoints_status(ctx.config)))
+                }
+                Err(e) => e,
+            },
+        },
+        Command {
+            name: "diagnostics",
+            while_busy: true,
+            description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off, /diagnostics rust off, /diagnostics clear)",
+            run: |args, ctx| diagnostics_command(args, ctx),
+        },
+        Command {
+            name: "steps",
+            while_busy: true,
+            description: "Show or set the step limit (/steps 40, /steps off never asks)",
+            run: |args, ctx| {
+                let arg = args.trim();
+                if arg.eq_ignore_ascii_case("off") {
+                    return CommandAction::Steps { every: 0 };
+                }
+                if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit()) {
+                    return match arg.parse::<u32>() {
+                        Err(_) => error("That's too many steps; use /steps off to never ask."),
+                        // 1 would ask after every step; use /steps off for never asking.
+                        Ok(1) => error("The smallest interval is 2 steps; /steps off never asks."),
+                        Ok(every) => CommandAction::Steps { every },
+                    };
+                }
+                if !arg.is_empty() {
+                    return error("Usage: /steps, /steps <number>, or /steps off");
+                }
+                print(steps_status(ctx.config))
+            },
+        },
+        Command {
+            name: "trust",
+            while_busy: false,
+            description: "Use this project's instructions, skills and agent types as yours (from the next start)",
+            run: |_, _| CommandAction::TrustProject,
+        },
+        Command { name: "clear", while_busy: false, description: "Clear the conversation", run: |_, _| CommandAction::Clear },
+        Command { name: "exit", while_busy: false, description: "Quit Marv", run: |_, _| CommandAction::Exit },
+    ];
+    COMMANDS
+}
+
+/// How the ctrl+k palette changes a setting (#44).
+#[derive(Clone, Copy)]
+pub enum SettingEdit {
+    /// On or off: choosing it runs `/<command> on` or `/<command> off`, the flip of what it is now.
+    Toggle(fn(&Config) -> bool),
+    /// Choosing it runs `/<command>`, which opens its picker. The value as shown.
+    Pick(fn(&Config) -> String),
+    /// Choosing it puts `/<command> ` in the prompt to finish. The value as shown.
+    Type(fn(&Config) -> String),
+}
+
+/// A setting the palette shows with its value. Changing it is its command's job, so the saving and the notice stay in
+/// one place ([`CommandAction`]).
+pub struct Setting {
+    /// As the palette shows it: "Yolo", "Step limit".
+    pub name: &'static str,
+    /// The command that shows and sets it, without the slash.
+    pub command: &'static str,
+    pub edit: SettingEdit,
+}
+
+/// What choosing a setting does, as a command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingChoice {
+    Run(String),
+    Prefill(String),
+}
+
+fn on_off_text(on: bool) -> String {
+    (if on { "on" } else { "off" }).into()
+}
+
+/// The settings the palette lists, the toggles first. A new one needs only a line here (and its command).
+pub fn settings() -> &'static [Setting] {
+    use SettingEdit::{Pick, Toggle, Type};
+    static SETTINGS: &[Setting] = &[
+        Setting { name: "Yolo", command: "yolo", edit: Toggle(|c| c.yolo) },
+        Setting { name: "Sandbox", command: "sandbox", edit: Toggle(|c| c.sandbox) },
+        Setting { name: "Thinking", command: "think", edit: Toggle(|c| c.thinking) },
+        Setting { name: "Diagnostics", command: "diagnostics", edit: Toggle(|c| c.diagnostics.any()) },
+        Setting { name: "Checks", command: "checks", edit: Toggle(|c| c.checks) },
+        Setting { name: "Checkpoints", command: "checkpoints", edit: Toggle(|c| c.checkpoints) },
+        Setting { name: "Trajectories", command: "trajectories", edit: Toggle(|c| c.trajectories) },
+        Setting { name: "Model", command: "model", edit: Pick(|c| c.model.clone()) },
+        Setting {
+            name: "Step limit",
+            command: "steps",
+            edit: Type(|c| if c.max_steps == 0 { "off".into() } else { c.max_steps.to_string() }),
+        },
+    ];
+    SETTINGS
+}
+
+impl Setting {
+    fn command_entry(&self) -> Option<&'static Command> {
+        commands().iter().find(|c| c.name == self.command)
+    }
+
+    /// Its value now: "on", "z-ai/glm-5.3-flash", "25".
+    pub fn value(&self, config: &Config) -> String {
+        match self.edit {
+            SettingEdit::Toggle(get) => on_off_text(get(config)),
+            SettingEdit::Pick(get) | SettingEdit::Type(get) => get(config),
+        }
+    }
+
+    /// Its command's description, so the two never drift.
+    pub fn description(&self) -> &'static str {
+        self.command_entry().map_or("", |c| c.description)
+    }
+
+    /// What choosing it does: a toggle runs its flip, a pick its command, a typed value prefills its command.
+    pub fn choice(&self, config: &Config) -> SettingChoice {
+        match self.edit {
+            SettingEdit::Toggle(get) => SettingChoice::Run(format!("/{} {}", self.command, on_off_text(!get(config)))),
+            SettingEdit::Pick(_) => SettingChoice::Run(format!("/{}", self.command)),
+            SettingEdit::Type(_) => SettingChoice::Prefill(format!("/{} ", self.command)),
+        }
+    }
+
+    /// Choosing it is fine while a reply streams: a toggle whose command is. A picker takes the keyboard, and a
+    /// prefilled command can't be sent until the reply ends.
+    pub fn while_busy(&self) -> bool {
+        matches!(self.edit, SettingEdit::Toggle(_)) && self.command_entry().is_some_and(|c| c.while_busy)
+    }
+}
+
+pub fn is_command(input: &str) -> bool {
+    input.starts_with('/')
+}
+
+/// Runs a `/command args` line.
+pub fn run_command(input: &str, ctx: &CommandContext) -> CommandAction {
+    let mut words = input[1..].split_whitespace();
+    let name = words.next().unwrap_or("").to_lowercase();
+    let rest = words.collect::<Vec<_>>().join(" ");
+    if let Some(command) = commands().iter().find(|c| c.name == name) {
+        return (command.run)(&rest, ctx);
+    }
+    if ctx.skills.iter().any(|s| s.skill.name == name) {
+        return CommandAction::Skill { name, args: rest };
+    }
+    error(format!("Unknown command: /{name}. Type /help for a list."))
+}
+
+pub fn help_text() -> String {
+    let width = commands().iter().map(|c| c.name.len()).max().unwrap_or(0) + 2;
+    let mut lines = vec!["Commands:".to_string()];
+    lines.extend(commands().iter().map(|c| format!("  /{:<width$}{}", c.name, c.description)));
+    lines.extend(
+        [
+            "",
+            "Shortcuts:",
+            "  ↑/↓       input history",
+            "  esc       stop a reply or tool",
+            "  ctrl+k    command palette: commands, skills, settings and keys",
+            "  ctrl+o    show subagents' steps and whole diffs",
+            "  ctrl+p    background processes: commands, addresses, live output (or click \"N running\")",
+            "  ctrl+c    clear input · press twice to exit",
+        ]
+        .map(String::from),
+    );
+    lines.join("\n")
+}
+
+fn config_text(ctx: &CommandContext) -> String {
+    let c = ctx.config;
+    let p = preset(c.provider);
+    let signed_in = || c.auth_file.clone().is_some_and(|path| marv_provider::chatgpt::AuthStore { path }.signed_in());
+    let key = match (p.key_env, &c.api_key) {
+        // #159: ChatGPT signs in instead.
+        (None, _) if c.provider == marv_provider::ProviderKind::ChatGpt => {
+            if signed_in() { "signed in with ChatGPT (/setup to change)" } else { "not signed in (/setup)" }.to_string()
+        }
+        (None, _) => "not needed".to_string(),
+        (Some(env), Some(k)) => {
+            format!("{} (from {})", mask_key(k), if c.api_key_source == Some(KeySource::Env) { env } else { "config file" })
+        }
+        (Some(_), None) => "not set".into(),
+    };
+    let mut lines = vec![
+        format!("Provider:  {}", p.label),
+        format!("Model:     {}", c.model),
+        format!("Thinking:  {}", if c.thinking { "on" } else { "off" }),
+        format!(
+            "Reasoning: {}{} (reasoningEffort in the config file)",
+            c.reasoning_effort.map_or("the model's default", |e| e.as_str()),
+            // Fitted per model (`marv_provider::effort_for_model`): the highest level the model takes up to this.
+            if c.reasoning_effort.is_some_and(|e| e > marv_provider::ReasoningEffort::High) {
+                ", or the highest the model takes"
+            } else {
+                ""
+            }
+        ),
+        format!("Sandbox:   {}", sandbox_status(c, ctx.sandbox_available, &[])),
+        format!("Yolo:      {} (/yolo)", if c.yolo { "on" } else { "off" }),
+        format!("Trajectories: {} (/trajectories)", if c.trajectories { "on" } else { "off" }),
+        format!("Diagnostics: {} (/diagnostics)", c.diagnostics.summary()),
+        format!("Checks:    {} (/checks)", if c.checks { "on" } else { "off" }),
+        format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
+        format!("Steps: {}", steps_status(c)),
+        format!("Compact:   {}", compact_status(c)),
+        format!("Mesh wake: {} (/mesh)", mesh_wake_word(c.mesh_wake)),
+        format!("Radio:     {} (/radio)", if c.mesh_radio { "on" } else { "off" }),
+        format!("Endpoint:  {}", c.base_url),
+    ];
+    if c.provider == marv_provider::ProviderKind::Ollama {
+        lines.push(format!("Context:   {} tokens (contextLength in the config file)", c.context_length));
+    }
+    lines.push(format!("API key:   {key}"));
+    lines.push(format!("File:      {}", ctx.config_path));
+    lines.join("\n")
+}
+
+/// When Marv summarizes the conversation (#140): `compactTokens`, or only the window rule when it's off.
+pub fn compact_status(config: &Config) -> String {
+    match config.compact_tokens {
+        Some(n) => format!(
+            "at {} tokens or 85% of the window, whichever comes first (compactTokens in the config file)",
+            crate::prompt::thousands(n as usize)
+        ),
+        None => "at 85% of the window (compactTokens is off in the config file)".into(),
+    }
+}
+
+pub fn diagnostics_status(config: &Config) -> String {
+    let d = config.diagnostics;
+    if !d.any() {
+        return "off".into();
+    }
+    // The languages with a checker in this version, and what runs for each.
+    let checkers = [
+        (Language::TypeScript, "TypeScript", "the project's typecheck"),
+        (Language::Rust, "Rust", "cargo check"),
+        (Language::Python, "Python", "pyright"),
+    ];
+    let or = |words: Vec<&str>| match words.split_last() {
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    let on: Vec<_> = checkers.iter().filter(|(language, _, _)| d.get(*language)).collect();
+    let what = if on.is_empty() {
+        format!(
+            "on, but not for {}: Marv won't run a checker after the model's edits",
+            or(checkers.iter().map(|c| c.1).collect())
+        )
+    } else {
+        format!(
+            "on: after the model changes files in a {} project, Marv runs {} (in the sandbox, read-only) and tells the model about new errors",
+            or(on.iter().map(|c| c.1).collect()),
+            or(on.iter().map(|c| c.2).collect())
+        )
+    };
+    if d.summary() == "on" { what } else { format!("{what} ({})", d.summary()) }
+}
+
+const DIAGNOSTICS_USAGE: &str =
+    "Usage: /diagnostics, /diagnostics on|off, /diagnostics <typescript|rust|python|go> on|off, or /diagnostics clear";
+
+/// `/diagnostics` (#187): the status (the setting, each checker's state, this project's cache), `on|off` for every
+/// language or one, and `clear`.
+fn diagnostics_command(args: &str, ctx: &CommandContext) -> CommandAction {
+    let words: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let on = |w: &str| match w {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    };
+    match words.as_slice() {
+        [] => print(diagnostics_text(ctx.config, ctx.diagnostics)),
+        ["clear"] => CommandAction::ClearCheckCache,
+        [w] if on(w).is_some() => CommandAction::Diagnostics { language: None, on: on(w).unwrap_or(true) },
+        [l, w] if Language::parse(l).is_some() && on(w).is_some() => {
+            CommandAction::Diagnostics { language: Language::parse(l), on: on(w).unwrap_or(true) }
+        }
+        _ => error(DIAGNOSTICS_USAGE),
+    }
+}
+
+/// What `/diagnostics` shows.
+pub fn diagnostics_text(config: &Config, info: Option<&DiagnosticsInfo>) -> String {
+    let mut lines = vec![format!("Diagnostics: {}", diagnostics_status(config))];
+    for language in Language::ALL {
+        let on = config.diagnostics.get(language);
+        let checker = info.and_then(|i| i.checkers.iter().find(|c| c.language == language));
+        let state = match (on, checker) {
+            (false, _) => "off".to_string(),
+            (true, Some(c)) => format!("on ({}: {})", c.label, c.state),
+            (true, None) if language == Language::TypeScript => "on (tsc)".to_string(),
+            (true, None) if language == Language::Rust => "on (cargo check)".to_string(),
+            (true, None) if language == Language::Python => "on (pyright)".to_string(),
+            (true, None) => "on (no checker for it in this version yet)".to_string(),
+        };
+        lines.push(format!("- {}: {state}", language.name()));
+    }
+    if let Some((dir, size)) = info.and_then(|i| i.cache.as_ref()) {
+        let size = size.map_or("not measured yet".to_string(), crate::diagnostics::cache::human_size);
+        lines.push(format!(
+            "Check cache for this project: {} ({size}; /diagnostics clear deletes it)",
+            printable(&dir.display().to_string())
+        ));
+    }
+    lines.join("\n")
+}
+
+/// `/radio` with the radio off (#124).
+/// [`marv_core::APPLIES_AT_NEXT_START`]: a change saved for the next conversation.
+pub const APPLIES_AT_NEXT_START: &str = marv_core::APPLIES_AT_NEXT_START;
+
+pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt, and can send each other short messages (/tx) and requests (/ask). A message reaches the other Marvs' models as data from another agent, never as their user's words.";
+
+/// `/tx`'s words: leading `@name`s (none: everyone), then the text. `None` without text.
+pub fn parse_tx(args: &str) -> Option<(Vec<String>, String)> {
+    let mut rest = args.trim_start();
+    let mut to = Vec::new();
+    while let Some(after) = rest.strip_prefix('@') {
+        let end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let name = &after[..end];
+        if name.is_empty() {
+            return None;
+        }
+        if name != "all" {
+            to.push(name.to_string());
+        }
+        rest = after[end..].trim_start();
+    }
+    let text = rest.trim_end();
+    (!text.is_empty()).then(|| (to, text.to_string()))
+}
+
+/// `/config`'s word for `mesh.wake`.
+fn mesh_wake_word(wake: crate::config::MeshWake) -> &'static str {
+    match wake {
+        crate::config::MeshWake::On => "on",
+        crate::config::MeshWake::Rules => "rules (the default)",
+        crate::config::MeshWake::Off => "off",
+    }
+}
+
+/// `/mesh wake` (#78; runtime-kernel live UX: rule wires wake unless it's turned off).
+pub fn mesh_wake_status(config: &Config) -> String {
+    match config.mesh_wake {
+        crate::config::MeshWake::On => format!(
+            "on: a message on a wired inbox starts a turn while Marv is idle (at most {} a minute per wire; never during a turn or while an approval waits, and never in marv -p). The message is read as data from another agent, never as your instructions, and the conversation counts as tainted (/mesh wake rules goes back to the default)",
+            crate::mesh::WAKES_PER_MINUTE
+        ),
+        crate::config::MeshWake::Rules => format!(
+            "rules (the default): a message on a wire one of your mesh rules made starts a turn while Marv is idle (up to hop {}, at most {} in {} minutes); messages on wires you approved by hand wait for your next turn (/mesh wake on lets them wake too, /mesh wake off stops every wake)",
+            crate::mesh::RULE_WAKE_MAX_HOP,
+            crate::mesh::RULE_WAKES_OVERALL,
+            crate::mesh::RULE_WAKES_WINDOW_MS / 60_000
+        ),
+        crate::config::MeshWake::Off => {
+            "off: messages wait in the inbox until your next turn (/mesh wake on lets one start a turn while Marv is idle, /mesh wake rules lets your mesh rules' wires)".into()
+        }
+    }
+}
+
+fn mesh_text(ctx: &CommandContext) -> String {
+    let mut parts = Vec::new();
+    match ctx.mesh {
+        None => parts.push("**Mesh**: this Marv isn't on the mesh.".to_string()),
+        Some(mesh) => {
+            parts.push(match &mesh.name {
+                Some(name) => {
+                    let name = printable(name);
+                    format!("**Mesh**: on the mesh as `{name}` (others reach you at `peer.{name}.agent.parent.inbox`).")
+                }
+                None => "**Mesh**: this session's own switchboard (not on the machine's mesh).".to_string(),
+            });
+            parts.push(if mesh.wired.is_empty() {
+                "Nothing is wired to Marv's inbox.".to_string()
+            } else {
+                let list = mesh.wired.iter().map(|w| format!("- `{}`", printable(w))).collect::<Vec<_>>().join("\n");
+                format!("Wired to Marv's inbox:\n{list}")
+            });
+        }
+    }
+    parts.push(format!("**Wake**: {}.", mesh_wake_status(ctx.config)));
+    parts.join("\n\n")
+}
+
+pub fn checkpoints_status(config: &Config) -> String {
+    if config.checkpoints {
+        "on: before a turn's first change Marv snapshots the project's files (git, under a hidden ref; never your branch, index or stash), so /undo can put them back".into()
+    } else {
+        "off".into()
+    }
+}
+
+pub fn checks_status(config: &Config) -> String {
+    if config.checks {
+        format!(
+            "on: after the model changes files, Marv runs the project's checks ({CHECKS_DIR}/) that concern them (in the sandbox, read-only) and tells the model about new violations"
+        )
+    } else {
+        "off".into()
+    }
+}
+
+fn checks_text(ctx: &CommandContext) -> String {
+    let (list, problems, last) = ctx.checks.unwrap_or((&[], &[], None));
+    let mut parts = vec![format!("**Checks**: {}.", checks_status(ctx.config))];
+    if list.is_empty() && problems.is_empty() {
+        parts.push(format!("This project has none. Add one rule per file to `{CHECKS_DIR}/`: a `.yaml` with `glob`, `forbid` or `require` (a regular expression), `message` and `why`, or a `.ts` script (`// glob: …` comment first) that prints violations as JSON lines `{{file, line, message, why}}`."));
+    } else {
+        parts.push(
+            list.iter()
+                .map(|c| {
+                    let what = match &c.body {
+                        crate::checks::load::CheckBody::Pattern { rule, message, .. } => format!(
+                            "{} a pattern: {}",
+                            if matches!(rule, crate::checks::load::CheckRule::Forbid(_)) { "forbids" } else { "requires" },
+                            printable(message)
+                        ),
+                        crate::checks::load::CheckBody::Script => "script".into(),
+                    };
+                    let not = if c.exclude.is_empty() { String::new() } else { format!(" · not {}", c.exclude.join(", ")) };
+                    format!("- `{}` *({what})*\n  {}{not}", c.name, c.glob.join(", "))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !problems.is_empty() {
+        parts.push("**Couldn't load:**".into());
+        parts.push(problems.iter().map(|p| format!("- {}", printable(p))).collect::<Vec<_>>().join("\n"));
+    }
+    parts.push(format!("**Last result:** {}", last_checks_text(last)));
+    parts.join("\n\n")
+}
+
+fn last_checks_text(last: Option<&ProjectCheckResult>) -> String {
+    use crate::diagnostics::turn::{CheckOutcome, FailReason, OffReason};
+    match last {
+        None => "none yet this session (checks run after a step that changed a file they concern).".into(),
+        Some(CheckOutcome::Off { reason: OffReason::NoSandbox }) => "off: they run only in the sandbox.".into(),
+        Some(CheckOutcome::Off { reason: OffReason::Timeouts }) => "off: they timed out twice this session.".into(),
+        Some(CheckOutcome::Off { reason: OffReason::Unreadable }) => {
+            "off: their output couldn't be read twice in a row this session.".into()
+        }
+        Some(CheckOutcome::Off { reason: OffReason::CacheTooBig }) => "off: their cache passed its size limit.".into(),
+        Some(CheckOutcome::Off { reason: OffReason::NotInstalled }) => "off: their runner isn't in the sandbox.".into(),
+        Some(CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, .. }) => {
+            format!("failed: {} isn't in the sandbox.", tool.as_deref().unwrap_or("bun"))
+        }
+        Some(CheckOutcome::Failed { reason, .. }) => {
+            format!("failed ({}).", if *reason == FailReason::Timeout { "timeout" } else { "unreadable" })
+        }
+        Some(CheckOutcome::Done { errors, added, ms, .. }) => {
+            let total = format!("{errors} violation{} in all", if *errors == 1 { "" } else { "s" });
+            if added.is_empty() {
+                format!("nothing new ({total}, {ms} ms).")
+            } else {
+                let mut lines = vec![format!("{} new ({total}, {ms} ms):", added.len())];
+                lines.extend(added.iter().map(|v| format!("- {}", printable(&crate::checks::kind::format_violation(v)))));
+                lines.join("\n")
+            }
+        }
+    }
+}
+
+pub fn steps_status(config: &Config) -> String {
+    if config.max_steps == 0 {
+        "off: Marv never asks to keep going, and a turn without an approver doesn't stop at a step limit either (subagents still stop at their own 50).".into()
+    } else {
+        format!(
+            "Keep going? after {} steps (0, or off, never asks). Without someone to ask, the turn stops there.",
+            config.max_steps
+        )
+    }
+}
+
+pub fn trajectories_status(config: &Config, path: Option<&str>) -> String {
+    if config.trajectories {
+        format!("on: every turn is logged to {} (rate turns with /good, /bad, /label)", path.unwrap_or("~/.marv/trajectories"))
+    } else {
+        "off: turns aren't logged".into()
+    }
+}
+
+/// What yolo mode does with this config, for the notice when it's changed. `config` is the config in effect after the
+/// change (`approve_sandboxed` as it resolves from the file, `MARV_YOLO` included); `yolo_allowed` is false where the
+/// project is the home folder or above it, where yolo doesn't apply (`sdk::no_yolo_reason`) but `approveSandboxed`
+/// does: the sandbox shows the project read-only there. The same state `/permissions` shows: sandboxed commands run
+/// unasked only with the setting and the sandbox on and working here.
+pub fn yolo_status(config: &Config, sandbox_available: bool, yolo_allowed: bool) -> String {
+    let confined = config.sandbox && sandbox_available;
+    let unasked = config.approve_sandboxed && confined;
+    if !yolo_allowed {
+        let commands = if unasked {
+            " Sandboxed commands without network still run without asking: the sandbox shows this folder read-only."
+        } else {
+            ""
+        };
+        return format!(
+            "Yolo is off in this folder (it is your home folder or above it): every file change asks first.{commands}"
+        );
+    }
+    // A turn a mesh message woke: unasked sandboxed commands only see the project read-only (docs/SECURITY.md).
+    let woken = " In a turn a mesh message woke they see the project read-only.";
+    if !config.yolo {
+        return if unasked {
+            format!(
+                "Yolo off: file changes ask first. Sandboxed commands without network still run without asking (approveSandboxed is auto in ~/.marv/config.json; set it to \"ask\" to be asked).{woken}"
+            )
+        } else {
+            "Yolo off: every change asks first, sandboxed commands too (approveSandboxed is ask).".into()
+        };
+    }
+    if confined {
+        let rest = if unasked {
+            format!(" (Sandboxed commands also run without asking with yolo off, while approveSandboxed is auto.{woken})")
+        } else {
+            String::new()
+        };
+        format!(
+            "Yolo on: sandboxed commands and file edits run without asking. Network access, git changes (git_write), edits inside .git, and memory still ask.{rest}"
+        )
+    } else {
+        format!(
+            "Yolo on: file edits run without asking. Commands still ask: {}, so nothing confines them.",
+            if config.sandbox {
+                format!("{} isn't available here", marv_sandbox::backend().name())
+            } else {
+                "the sandbox is off".into()
+            }
+        )
+    }
+}
+
+/// The startup message for PATH folders the sandbox can't see.
+pub fn hidden_path_folders_notice(folders: &[String]) -> String {
+    let one = folders.len() == 1;
+    format!(
+        "Your PATH has {} folder{} the sandbox can't see: {}. Commands in Marv can't run the tool{} in it, and tsc and other node_modules scripts may not run. Tell Marv's sandbox about it (an issue on the repository) or add the tool to a folder it does show, like ~/.local/bin.",
+        folders.len(),
+        if one { "" } else { "s" },
+        folders.join(", "),
+        if one { "" } else { "s" }
+    )
+}
+
+fn sandbox_status(config: &Config, available: bool, hidden: &[String]) -> String {
+    if !config.sandbox {
+        return "off: bash commands run directly on your system (after approval)".into();
+    }
+    if !available {
+        return format!("on, but {} isn't available here, so bash runs WITHOUT a sandbox", marv_sandbox::backend().name());
+    }
+    let hidden = if hidden.is_empty() { String::new() } else { format!(" {}", hidden_path_folders_notice(hidden)) };
+    format!(
+        "on: bash runs in {} (project writable, home hidden, no network unless asked).{hidden}",
+        marv_sandbox::backend().name()
+    )
+}
+
+const MCP_USAGE: &str = "Usage: /mcp (list servers), /mcp add <npm package | pypi:<package> | https URL | GitHub repo | registry name> [--name <name>] [--env VAR] [--header \"Name: Bearer ${VAR}\"] [-- <server args>], /mcp search <words>, /mcp remove <name>, /mcp trust, /mcp login <name>, /mcp logout <name>";
+
+const MCP_HELP: &str = "No MCP servers yet. Add one with `/mcp add <npm package | URL | GitHub repo>` (find one with `/mcp search <words>`), or by hand in `.mcp.json` in the project, or `~/.marv/mcp.json` for every project (the same format as Claude Code's), then restart Marv:\n\n```json\n{ \"mcpServers\": {\n    \"files\": { \"command\": \"npx\", \"args\": [\"-y\", \"some-mcp-server\"] },\n    \"docs\": { \"type\": \"http\", \"url\": \"https://example.com/mcp\", \"headers\": { \"Authorization\": \"Bearer ${DOCS_TOKEN}\" } } } }\n```";
+
+fn mcp_command(args: &str, ctx: &CommandContext) -> CommandAction {
+    let servers: &[McpServerStatus] = ctx.mcp.map_or(&[], |m| m.0);
+    if args.is_empty() {
+        return markdown(mcp_text(ctx));
+    }
+    let mut words = args.split_whitespace();
+    let sub = words.next().unwrap_or("");
+    let words: Vec<&str> = words.collect();
+    let rest = args[sub.len()..].trim();
+    let action = match sub.to_lowercase().as_str() {
+        "trust" if rest.is_empty() => Some(CommandAction::McpTrust),
+        "add" if !rest.is_empty() => Some(CommandAction::McpAdd { args: rest.into() }),
+        "search" if !rest.is_empty() => Some(CommandAction::McpSearch { words: rest.into() }),
+        "remove" if words.len() == 1 => Some(CommandAction::McpRemove { name: words[0].into() }),
+        "login" => Some(login_action(true, &words, servers)),
+        "logout" => Some(login_action(false, &words, servers)),
+        _ => None,
+    };
+    action.unwrap_or_else(|| error(MCP_USAGE))
+}
+
+/// `/mcp login|logout <server>`: only a server that can log in; otherwise say which can.
+fn login_action(login: bool, words: &[&str], servers: &[McpServerStatus]) -> CommandAction {
+    let can: Vec<&str> = servers.iter().filter(|s| s.login.is_some()).map(|s| s.name.as_str()).collect();
+    if words.len() == 1 && can.contains(&words[0]) {
+        let server = words[0].to_string();
+        return if login { CommandAction::McpLogin { server } } else { CommandAction::McpLogout { server } };
+    }
+    let verb = if login { "login" } else { "logout" };
+    if can.is_empty() {
+        error(format!(
+            "Usage: /mcp {verb} <name>. No server here can log in: logins are for remote (http) servers without an Authorization header of their own."
+        ))
+    } else {
+        error(format!(
+            "Usage: /mcp {verb} <name>, one of {}",
+            can.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+fn mcp_text(ctx: &CommandContext) -> String {
+    let Some((servers, problems)) = ctx.mcp else {
+        return MCP_HELP.into();
+    };
+    if servers.is_empty() && problems.is_empty() {
+        return MCP_HELP.into();
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut lines: Vec<String> = servers
+        .iter()
+        .map(|s| {
+            let who =
+                format!("- **{}** ({}): ", s.name, if s.source == ServerSource::Project { "this project" } else { "yours" });
+            match s.state {
+                McpState::Connected => {
+                    let tools = s
+                        .tools
+                        .iter()
+                        .map(|t| format!("`{}`", t.replace(&format!("mcp__{}__", s.name), "")))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let login = match &s.login {
+                        Some(l) if l.logged_in => format!(
+                            " · logged in{} (renewed automatically)",
+                            l.host.as_ref().map(|h| format!(" at {h}")).unwrap_or_default()
+                        ),
+                        _ => String::new(),
+                    };
+                    let skipped = if s.skipped.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; not offered (another server's tool has the name): {}",
+                            s.skipped.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    format!(
+                        "{who}connected · {} tool{}{}{login}{skipped}",
+                        s.tools.len(),
+                        plural(s.tools.len()),
+                        if tools.is_empty() { String::new() } else { format!(": {tools}") }
+                    )
+                }
+                McpState::Untrusted => {
+                    let reads = if s.reads.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; reads {} from your environment",
+                            s.reads.iter().map(|v| format!("`${v}`")).collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    let files = if s.runs_project_files.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; runs this project's {}",
+                            s.runs_project_files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    format!("{who}not trusted yet: `{}`{reads}{files} (`/mcp trust` to start it)", s.target)
+                }
+                McpState::Connecting => format!("{who}starting…"),
+                McpState::NeedsLogin => format!("{who}needs login: `/mcp login {}`", s.name),
+                McpState::Removed => format!("{who}removed (its tools stay listed, failing, until `/clear` or a restart)"),
+                McpState::Failed => {
+                    let stderr = s.stderr.as_ref().map(|e| {
+                        let lines: Vec<&str> = e.lines().collect();
+                        let tail = lines[lines.len().saturating_sub(5)..].join("\n  ");
+                        format!("\n\n  ```\n  {}\n  ```", printable(&tail))
+                    });
+                    format!(
+                        "{who}failed: {}{}",
+                        printable(s.error.as_deref().unwrap_or("unknown error")),
+                        stderr.unwrap_or_default()
+                    )
+                }
+            }
+        })
+        .collect();
+    if !problems.is_empty() {
+        lines.push(String::new());
+        lines.push("Couldn't load:".into());
+        lines.extend(problems.iter().map(|p| format!("- {p}")));
+    }
+    lines.join("\n")
+}
+
+fn skills_text(skills: &[LoadedSkill], problems: &[String]) -> String {
+    let mut parts = if skills.is_empty() {
+        vec![
+            "**No skills yet.** Add one as `.marv/skills/<name>/SKILL.md` in the project, or in `~/.marv/skills/` for all projects:".to_string(),
+            "```markdown\n---\nname: <name>\ndescription: <what it does, and when to use it>\n---\n\n<instructions>\n```".to_string(),
+        ]
+    } else {
+        vec![
+            "**Skills**: run one with `/<name>`, or let Marv pick when a request matches.".to_string(),
+            skills
+                .iter()
+                .map(|s| {
+                    // A skill linked to a system folder shows where it really is (#75): it's read from there.
+                    let note = match (&s.link, s.source) {
+                        (Some(link), _) => format!(" *(personal: {})*", printable(link)),
+                        (None, SkillSource::Personal) => " *(personal)*".to_string(),
+                        (None, SkillSource::Project) => String::new(),
+                    };
+                    format!("- `/{}`: {}{note}", s.skill.name, printable(&s.skill.description))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ]
+    };
+    if !problems.is_empty() {
+        parts.push("**Couldn't load:**".into());
+        parts.push(problems.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"));
+    }
+    parts.join("\n\n")
+}
+
+fn agents_text(agents: &[AgentType], problems: &[String]) -> String {
+    let list = agents
+        .iter()
+        .map(|a| {
+            let mut details = Vec::new();
+            if a.tools.len() != SUBAGENT_TOOLS.len() {
+                details.push(format!("tools: {}", a.tools.join(", ")));
+            }
+            if let Some(m) = &a.model {
+                details.push(format!("model: {m}"));
+            }
+            let first = printable(a.description.lines().next().unwrap_or(""));
+            let details = if details.is_empty() { String::new() } else { format!("\n  {}", details.join(" · ")) };
+            format!("- `{}` *({})*: {first}{details}", a.name, a.source.label())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut parts = vec!["**Agents**: Marv can hand a task to one of these. Add your own as `.marv/agents/<name>.md` (project) or `~/.marv/agents/<name>.md`.".to_string(), list];
+    if !problems.is_empty() {
+        parts.push("**Couldn't load:**".into());
+        parts.push(problems.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"));
+    }
+    parts.join("\n\n")
+}
+
+/// `/role`: the chat's role and its bounds, or how to start a chat with one.
+pub fn role_text(role: Option<&crate::roles::Role>) -> String {
+    match role {
+        Some(role) => role.summary(),
+        None => "This chat has no role. Start one with marv --role <name> (or pick a role for a new desktop chat); roles are files in .marv/roles/ or ~/.marv/roles/, plus the built-in coordinator and worker.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Env, resolve_config};
+
+    #[test]
+    fn role_shows_the_chats_role_or_how_to_get_one() {
+        with(|ctx| {
+            let CommandAction::Print { text, .. } = run_command("/role", ctx) else { panic!() };
+            assert!(text.starts_with("This chat has no role."), "{text}");
+            let role = crate::roles::coordinator();
+            let CommandAction::Print { text, .. } = run_command("/role", &CommandContext { role: Some(&role), ..ctx.clone() })
+            else {
+                panic!()
+            };
+            assert!(text.starts_with("Role: coordinator (built-in)") && text.contains("Writes: nothing"), "{text}");
+        });
+    }
+
+    fn with<R>(f: impl FnOnce(&CommandContext) -> R) -> R {
+        let config =
+            resolve_config(None, &Env::from([("OPENROUTER_API_KEY".to_string(), "sk-or-v1-abcdefghijklmnop-wxyz".to_string())]));
+        let ctx = CommandContext {
+            config: &config,
+            config_path: "~/.marv/config.json".into(),
+            skills: &[],
+            agents: &[],
+            agent_problems: &[],
+            skill_problems: &[],
+            mcp: None,
+            trajectories_path: None,
+            usage: None,
+            folder_day: None,
+            checks: None,
+            checkpoints: None,
+            hidden_path_folders: &[],
+            sandbox_available: true,
+            processes: None,
+            mesh: None,
+            permissions: None,
+            role: None,
+            diagnostics: None,
+        };
+        f(&ctx)
+    }
+
+    /// #187: `/diagnostics` per language, `clear`, and the status with each checker's state and the cache.
+    #[test]
+    fn diagnostics_takes_a_language_and_clear_and_shows_each_checker() {
+        use crate::session::{CheckerInfo, DiagnosticsInfo};
+        with(|ctx| {
+            assert_eq!(run_command("/diagnostics off", ctx), CommandAction::Diagnostics { language: None, on: false });
+            assert_eq!(
+                run_command("/diagnostics rust off", ctx),
+                CommandAction::Diagnostics { language: Some(Language::Rust), on: false }
+            );
+            assert_eq!(
+                run_command("/diagnostics Go ON", ctx),
+                CommandAction::Diagnostics { language: Some(Language::Go), on: true }
+            );
+            assert_eq!(run_command("/diagnostics clear", ctx), CommandAction::ClearCheckCache);
+            for bad in ["/diagnostics ruby off", "/diagnostics rust", "/diagnostics on off", "/diagnostics clear all"] {
+                assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+            let CommandAction::Print { text, .. } = run_command("/diagnostics", ctx) else { panic!() };
+            assert!(
+                text.starts_with(
+                    "Diagnostics: on: after the model changes files in a TypeScript, Rust or Python project, Marv runs the project's typecheck, cargo check or pyright (in the sandbox, read-only)"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("\n- typescript: on (tsc)\n")
+                    && text.contains("\n- rust: on (cargo check)\n")
+                    && text.contains("\n- python: on (pyright)\n")
+                    && text.contains("\n- go: on (no checker for it in this version yet)"),
+                "{text}"
+            );
+            let info = DiagnosticsInfo {
+                checkers: vec![
+                    CheckerInfo {
+                        language: Language::TypeScript,
+                        label: "tsc",
+                        state: "off for this session: it timed out twice".into(),
+                    },
+                    CheckerInfo {
+                        language: Language::Rust,
+                        label: "cargo check",
+                        state: "not installed (Marv doesn't install toolchains)".into(),
+                    },
+                ],
+                cache: Some(("/home/me/.cache/marv/checks/repo-abc".into(), Some(3 * 1024 * 1024 * 1024))),
+            };
+            let mut config = ctx.config.clone();
+            config.diagnostics = config.diagnostics.with(Language::Go, false);
+            let text = diagnostics_text(&config, Some(&info));
+            assert!(text.contains("- typescript: on (tsc: off for this session: it timed out twice)"), "{text}");
+            assert!(text.contains("- rust: on (cargo check: not installed (Marv doesn't install toolchains))"), "{text}");
+            assert!(text.contains("- go: off") && text.contains("(off for go)"), "{text}");
+            assert!(text.contains("/home/me/.cache/marv/checks/repo-abc (3.0 GB;"), "{text}");
+        });
+    }
+
+    // #82: /permissions only shows; without the session's grants it says so, with them it renders them as markdown.
+    #[test]
+    fn permissions_shows_the_grants_and_takes_no_arguments() {
+        with(|ctx| {
+            assert_eq!(run_command("/permissions", ctx), print("Permissions aren't available here."));
+            assert!(matches!(run_command("/permissions revoke", ctx), CommandAction::Print { is_error: true, .. }));
+            let grants = crate::permissions::Permissions {
+                remembered: vec!["bash:git:git commit".into()],
+                pre_approved: vec!["web".into()],
+                ..Default::default()
+            };
+            let shown = CommandContext { permissions: Some(&grants), ..ctx.clone() };
+            let CommandAction::Print { text, is_error: false, markdown: true } = run_command("/permissions", &shown) else {
+                panic!()
+            };
+            assert!(text.contains("- Git commands that write: `git commit`"), "{text}");
+            assert!(text.contains("- `web` (from --approve)"), "{text}");
+            assert!(text.contains("- ~/.marv/config.json: no `approve` or `writable`"), "{text}");
+            assert!(commands().iter().any(|c| c.name == "permissions" && c.while_busy));
+        });
+    }
+
+    #[test]
+    fn mesh_shows_the_wires_and_wake_and_turns_wake_on_and_off() {
+        with(|ctx| {
+            assert_eq!(run_command("/mesh wake on", ctx), CommandAction::MeshWake { wake: Some(true) });
+            assert_eq!(run_command("/mesh wake OFF", ctx), CommandAction::MeshWake { wake: Some(false) });
+            assert_eq!(run_command("/mesh wake rules", ctx), CommandAction::MeshWake { wake: None }, "back to the default");
+            for bad in ["/mesh wake maybe", "/mesh frob", "/mesh wake on now"] {
+                assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+            let CommandAction::Print { text, is_error: false, .. } = run_command("/mesh", ctx) else { panic!() };
+            assert!(text.contains("isn't on the mesh") && text.contains("**Wake**: rules (the default)"), "{text}");
+            let CommandAction::Print { text, .. } = run_command("/mesh wake", ctx) else { panic!() };
+            assert!(
+                text.starts_with("Mesh wake: rules (the default): a message on a wire one of your mesh rules made"),
+                "{text}"
+            );
+            assert!(text.contains("up to hop 2") && text.contains("wires you approved by hand wait"), "{text}");
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("Mesh wake: rules (the default) (/mesh)"), "{text}");
+            let off = Config { mesh_wake: crate::config::MeshWake::Off, ..ctx.config.clone() };
+            let CommandAction::Print { text, .. } = run_command("/mesh wake", &CommandContext { config: &off, ..ctx.clone() })
+            else {
+                panic!()
+            };
+            assert!(text.starts_with("Mesh wake: off"), "{text}");
+
+            let on = Config { mesh_wake: crate::config::MeshWake::On, ..ctx.config.clone() };
+            let status = MeshStatus {
+                name: Some("beta".into()),
+                wired: vec!["peer-alpha -> agent.parent.inbox".into(), "x\u{1b}[2J -> agent.parent.inbox".into()],
+            };
+            let shown = CommandContext { config: &on, mesh: Some(&status), ..ctx.clone() };
+            let CommandAction::Print { text, .. } = run_command("/mesh", &shown) else { panic!() };
+            assert!(text.contains("on the mesh as `beta`") && text.contains("- `peer-alpha -> agent.parent.inbox`"), "{text}");
+            assert!(!text.contains('\u{1b}'), "printable: {text}");
+            assert!(text.contains("**Wake**: on") && text.contains("at most 3 a minute per wire"), "{text}");
+        });
+    }
+
+    #[test]
+    fn tx_takes_names_then_the_text() {
+        assert_eq!(parse_tx("@58a7 tests pass"), Some((vec!["58a7".into()], "tests pass".into())));
+        assert_eq!(parse_tx(" @a  @b  hi there "), Some((vec!["a".into(), "b".into()], "hi there".into())));
+        assert_eq!(parse_tx("tests pass on @main"), Some((vec![], "tests pass on @main".into())));
+        assert_eq!(parse_tx("@all hi"), Some((vec![], "hi".into())));
+        assert_eq!(parse_tx("@58a7"), None);
+        assert_eq!(parse_tx("  "), None);
+        assert_eq!(parse_tx("@ hi"), None);
+        with(|ctx| {
+            assert!(matches!(run_command("/tx hi", ctx), CommandAction::Print { .. }), "the radio is off");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            let ctx = CommandContext { config: &on, ..ctx.clone() };
+            assert_eq!(run_command("/tx @b2 hi", &ctx), CommandAction::Tx { to: vec!["b2".into()], text: "hi".into() });
+            assert!(matches!(run_command("/tx", &ctx), CommandAction::Print { is_error: true, .. }));
+        });
+    }
+
+    /// #124, phase 3: `/ask` takes exactly one name, then the text.
+    #[test]
+    fn ask_takes_one_name_then_the_text() {
+        with(|ctx| {
+            assert!(matches!(run_command("/ask @b2 hi", ctx), CommandAction::Print { is_error: false, .. }), "the radio is off");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            let ctx = CommandContext { config: &on, ..ctx.clone() };
+            assert_eq!(
+                run_command("/ask @b2 run the e2e suite", &ctx),
+                CommandAction::Ask { to: "b2".into(), text: "run the e2e suite".into() }
+            );
+            for bad in ["/ask", "/ask run it", "/ask @a @b run it", "/ask @all run it", "/ask @b2"] {
+                assert!(matches!(run_command(bad, &ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+        });
+    }
+
+    #[test]
+    fn radio_turns_on_and_off_and_shows_the_view_only_when_on() {
+        with(|ctx| {
+            assert_eq!(run_command("/radio on", ctx), CommandAction::Radio { on: true });
+            assert_eq!(run_command("/radio OFF", ctx), CommandAction::Radio { on: false });
+            assert!(matches!(run_command("/radio loud", ctx), CommandAction::Print { is_error: true, .. }));
+            let CommandAction::Print { text, is_error: false, .. } = run_command("/radio", ctx) else { panic!() };
+            assert!(text.starts_with("The radio is off. /radio on"), "{text}");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            assert_eq!(run_command("/radio", &CommandContext { config: &on, ..ctx.clone() }), CommandAction::RadioView);
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("Radio:     off (/radio)"), "{text}");
+            assert!(text.contains("Compact:   at 100,000 tokens or 85% of the window"), "{text}");
+            assert!(
+                text.contains("Reasoning: max, or the highest the model takes (reasoningEffort in the config file)"),
+                "{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn compact_status_says_the_size_or_that_its_off() {
+        let config = crate::config::resolve_config(None, &crate::config::Env::new());
+        assert!(compact_status(&config).starts_with("at 100,000 tokens or 85% of the window"));
+        let off = Config { compact_tokens: None, ..config };
+        assert_eq!(compact_status(&off), "at 85% of the window (compactTokens is off in the config file)");
+    }
+
+    #[test]
+    fn yolo_status_says_what_is_in_effect() {
+        let config = |yolo: bool, approve: bool, sandbox: bool| {
+            let mut c = resolve_config(None, &Env::new());
+            (c.yolo, c.approve_sandboxed, c.sandbox) = (yolo, approve, sandbox);
+            c
+        };
+        // Held off (MARV_YOLO=off, `ask`): never claims sandboxed commands run unasked.
+        assert!(!yolo_status(&config(false, false, true), true, true).contains("still run without asking"));
+        assert!(yolo_status(&config(false, false, true), true, true).contains("sandboxed commands too"));
+        assert!(yolo_status(&config(false, true, true), true, true).contains("still run without asking"));
+        assert!(yolo_status(&config(false, true, true), true, true).contains("read-only"));
+        // No working sandbox, or the sandbox off: nothing runs unasked.
+        assert_eq!(
+            yolo_status(&config(false, true, true), false, true),
+            "Yolo off: every change asks first, sandboxed commands too (approveSandboxed is ask)."
+        );
+        assert!(!yolo_status(&config(false, true, false), true, true).contains("still run without asking"));
+        assert!(!yolo_status(&config(true, true, true), false, true).contains("also run without asking"));
+        // Yolo on.
+        assert!(yolo_status(&config(true, true, true), true, true).contains("also run without asking"));
+        assert!(!yolo_status(&config(true, false, true), true, true).contains("also run without asking"));
+        // The home folder: yolo doesn't apply, approveSandboxed does (the sandbox is read-only there).
+        let home = yolo_status(&config(true, true, true), true, false);
+        assert!(home.contains("every file change asks first") && home.contains("still run without asking"), "{home}");
+        let home = yolo_status(&config(true, true, false), true, false);
+        assert!(home.contains("every file change asks first") && !home.contains("without asking"), "{home}");
+    }
+
+    #[test]
+    fn every_setting_is_set_by_a_command_and_a_toggle_runs_the_same_action_as_typing_it() {
+        for setting in settings() {
+            assert!(commands().iter().any(|c| c.name == setting.command), "{} has no command", setting.name);
+            assert!(!setting.description().is_empty());
+        }
+        let config = |yolo: bool| {
+            let mut c = resolve_config(None, &Env::new());
+            c.yolo = yolo;
+            c.max_steps = 25;
+            c
+        };
+        let yolo = settings().iter().find(|s| s.name == "Yolo").unwrap();
+        assert_eq!(yolo.value(&config(true)), "on");
+        assert_eq!(yolo.choice(&config(true)), SettingChoice::Run("/yolo off".into()));
+        assert_eq!(yolo.choice(&config(false)), SettingChoice::Run("/yolo on".into()));
+        assert!(yolo.while_busy());
+        // The choice is a command line: it goes the way the slash command goes.
+        for setting in settings().iter().filter(|s| matches!(s.edit, SettingEdit::Toggle(_))) {
+            for on in [true, false] {
+                let mut c = config(false);
+                match setting.command {
+                    "yolo" => c.yolo = on,
+                    "sandbox" => c.sandbox = on,
+                    "think" => c.thinking = on,
+                    "diagnostics" => c.diagnostics = on.into(),
+                    "checks" => c.checks = on,
+                    "checkpoints" => c.checkpoints = on,
+                    "trajectories" => c.trajectories = on,
+                    other => panic!("a new toggle: {other}"),
+                }
+                assert_eq!(setting.value(&c), if on { "on" } else { "off" });
+                let SettingChoice::Run(line) = setting.choice(&c) else { panic!("a toggle runs") };
+                let action = with(|ctx| run_command(&line, &CommandContext { config: &c, ..ctx.clone() }));
+                let flipped = match action {
+                    CommandAction::Yolo { on }
+                    | CommandAction::Sandbox { on }
+                    | CommandAction::Thinking { on }
+                    | CommandAction::Diagnostics { on, language: None }
+                    | CommandAction::Checks { on }
+                    | CommandAction::Checkpoints { on }
+                    | CommandAction::Trajectories { on } => on,
+                    other => panic!("{line}: {other:?}"),
+                };
+                assert_eq!(flipped, !on, "{line}");
+            }
+        }
+        let model = settings().iter().find(|s| s.name == "Model").unwrap();
+        assert_eq!(model.choice(&config(false)), SettingChoice::Run("/model".into()));
+        assert!(!model.while_busy());
+        let steps = settings().iter().find(|s| s.name == "Step limit").unwrap();
+        assert_eq!(steps.value(&config(false)), "25");
+        assert_eq!(steps.value(&Config { max_steps: 0, ..config(false) }), "off");
+        assert_eq!(steps.choice(&config(false)), SettingChoice::Prefill("/steps ".into()));
+        assert!(!steps.while_busy());
+    }
+
+    #[test]
+    fn only_commands_that_show_something_or_set_from_the_next_turn_run_during_a_reply() {
+        let busy: Vec<&str> = commands().iter().filter(|c| c.while_busy).map(|c| c.name).collect();
+        for name in ["undo", "clear", "resume", "compact", "setup", "model", "mcp", "exit", "good", "trajectories"] {
+            assert!(!busy.contains(&name), "/{name} needs an idle session");
+        }
+        for name in ["help", "cost", "config", "yolo", "think", "steps"] {
+            assert!(busy.contains(&name), "/{name} can run during a reply");
+        }
+    }
+
+    #[test]
+    fn help_mentions_the_palette() {
+        assert!(help_text().contains("ctrl+k    command palette"));
+    }
+
+    #[test]
+    fn skills_shows_where_a_linked_system_skill_really_is() {
+        let skill = |name: &str, source, link: Option<&str>| LoadedSkill {
+            skill: marv_tools::Skill {
+                name: name.into(),
+                description: "D.".into(),
+                dir: "/x".into(),
+                body: String::new(),
+                files: vec![],
+                trusted_files: None,
+            },
+            source,
+            link: link.map(Into::into),
+        };
+        let skills = [
+            skill("notes", SkillSource::Project, None),
+            skill("omarchy", SkillSource::Personal, Some("omarchy → /usr/share/omarchy/skills/omarchy\x1b[2J")),
+            skill("todo", SkillSource::Personal, None),
+        ];
+        let text = skills_text(&skills, &[]);
+        assert!(text.contains("- `/notes`: D.\n"), "{text}");
+        assert!(text.contains("- `/omarchy`: D. *(personal: omarchy → /usr/share/omarchy/skills/omarchy)*"), "{text}");
+        assert!(text.contains("- `/todo`: D. *(personal)*"), "{text}");
+        assert!(!text.contains('\x1b'));
+    }
+
+    #[test]
+    fn peers_lists_reads_and_stops_as_actions() {
+        with(|ctx| {
+            assert_eq!(run_command("/peers", ctx), CommandAction::Peers { read: None, stop: None });
+            assert_eq!(run_command("/peers read w1", ctx), CommandAction::Peers { read: Some("w1".into()), stop: None });
+            assert_eq!(run_command("/peers stop w1", ctx), CommandAction::Peers { read: None, stop: Some("w1".into()) });
+            for bad in ["/peers stop", "/peers kill w1", "/peers read a b"] {
+                assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+        });
+    }
+
+    #[test]
+    fn processes_lists_the_sessions_background_processes_and_stop_is_an_action() {
+        let now = marv_tools::process::now_ms();
+        let web = marv_tools::ProcessInfo {
+            name: "web".into(),
+            command: "bun run dev".into(),
+            network: false,
+            state: marv_tools::ProcessState::Running,
+            exit_code: None,
+            ports: vec![5173],
+            notes: vec![],
+            started_at: now - 125_000,
+        };
+        let old = marv_tools::ProcessInfo {
+            name: "old".into(),
+            state: marv_tools::ProcessState::Exited,
+            exit_code: Some(1),
+            ports: vec![],
+            ..web.clone()
+        };
+        with(|ctx| {
+            let list = [web, old];
+            let listed = CommandContext { processes: Some(&list), ..ctx.clone() };
+            assert_eq!(
+                run_command("/processes", &listed),
+                print(
+                    "web: running · http://localhost:5173 · up 2m · $ bun run dev\nold: exited (code 1) · up 2m · $ bun run dev"
+                )
+            );
+            let none = CommandContext { processes: Some(&[]), ..ctx.clone() };
+            assert!(
+                matches!(run_command("/processes", &none), CommandAction::Print { text, .. } if text.contains("No background processes"))
+            );
+            assert!(
+                matches!(run_command("/processes", ctx), CommandAction::Print { text, .. } if text.contains("need the bubblewrap sandbox"))
+            );
+            assert_eq!(run_command("/processes stop web", ctx), CommandAction::Processes { stop: "web".into() });
+            for bad in ["/processes stop", "/processes kill web", "/processes stop a b"] {
+                assert!(
+                    matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, ref text, .. } if text.contains("Usage")),
+                    "{bad}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn commands_map_to_actions() {
+        with(|ctx| {
+            assert!(is_command("/x") && !is_command("x"));
+            assert_eq!(run_command("/CLEAR", ctx), CommandAction::Clear);
+            assert_eq!(run_command("/model", ctx), CommandAction::Model { id: None });
+            assert_eq!(run_command("/model a/b", ctx), CommandAction::Model { id: Some("a/b".into()) });
+            // Thinking is on by default (0.15.0): a bare /think turns it off.
+            assert_eq!(run_command("/think", ctx), CommandAction::Thinking { on: false });
+            assert_eq!(run_command("/yolo off", ctx), CommandAction::Yolo { on: false });
+            assert_eq!(
+                run_command("/remember project: uses tabs", ctx),
+                CommandAction::Remember { scope: MemoryTarget::Project, text: "uses tabs".into() }
+            );
+            assert_eq!(
+                run_command("/label refactor, tests", ctx),
+                CommandAction::Feedback { score: 0, note: None, labels: Some(vec!["refactor".into(), "tests".into()]) }
+            );
+            assert_eq!(
+                run_command("/good  nice ", ctx),
+                CommandAction::Feedback { score: 1, note: Some("nice".into()), labels: None }
+            );
+            assert!(matches!(run_command("/nope", ctx), CommandAction::Print { is_error: true, .. }));
+        });
+    }
+
+    #[test]
+    fn steps() {
+        with(|ctx| {
+            assert_eq!(run_command("/steps 40", ctx), CommandAction::Steps { every: 40 });
+            assert_eq!(run_command("/steps OFF", ctx), CommandAction::Steps { every: 0 });
+            assert!(matches!(run_command("/steps 1", ctx), CommandAction::Print { is_error: true, .. }));
+            assert!(matches!(run_command("/steps 99999999999999", ctx), CommandAction::Print { is_error: true, .. }));
+            assert!(matches!(run_command("/steps", ctx), CommandAction::Print { is_error: false, .. }));
+        });
+    }
+
+    #[test]
+    fn help_and_config() {
+        with(|ctx| {
+            let CommandAction::Print { text, .. } = run_command("/help", ctx) else { panic!() };
+            assert!(commands().iter().all(|c| text.contains(&format!("/{}", c.name))));
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("sk-or-v1-a…wxyz (from OPENROUTER_API_KEY)"));
+        });
+    }
+
+    #[test]
+    fn undo_and_checkpoints_says_what_it_does_and_the_last_failure_or_turns_it_on_and_off() {
+        with(|ctx| {
+            assert_eq!(run_command("/undo", ctx), CommandAction::Undo);
+            assert!(matches!(run_command("/undo 3", ctx), CommandAction::Print { is_error: true, .. }));
+            assert_eq!(run_command("/checkpoints off", ctx), CommandAction::Checkpoints { on: false });
+            assert_eq!(run_command("/checkpoints on", ctx), CommandAction::Checkpoints { on: true });
+            let CommandAction::Print { text, is_error: false, .. } = run_command("/checkpoints", ctx) else { panic!() };
+            assert!(text.contains("/undo"), "{text}");
+            assert!(matches!(run_command("/checkpoints maybe", ctx), CommandAction::Print { is_error: true, .. }));
+            let failed = CheckpointProblem { failure: Some("disk full".into()), off: None };
+            let CommandAction::Print { text, .. } =
+                run_command("/checkpoints", &CommandContext { checkpoints: Some(&failed), ..ctx.clone() })
+            else {
+                panic!()
+            };
+            assert!(text.contains("disk full"), "{text}");
+            let off = Config { checkpoints: false, ..ctx.config.clone() };
+            assert_eq!(
+                run_command("/checkpoints", &CommandContext { config: &off, ..ctx.clone() }),
+                CommandAction::Print { text: "Checkpoints: off".into(), is_error: false, markdown: false }
+            );
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("Checkpoints: on (/checkpoints, /undo)"));
+        });
+    }
+
+    #[test]
+    fn mcp_subcommands() {
+        with(|ctx| {
+            assert_eq!(run_command("/mcp trust", ctx), CommandAction::McpTrust);
+            assert_eq!(run_command("/mcp add pypi:x --name y", ctx), CommandAction::McpAdd { args: "pypi:x --name y".into() });
+            assert_eq!(run_command("/mcp remove gh", ctx), CommandAction::McpRemove { name: "gh".into() });
+            assert!(matches!(run_command("/mcp __proto__", ctx), CommandAction::Print { is_error: true, .. }));
+            assert!(matches!(run_command("/mcp login gh", ctx), CommandAction::Print { is_error: true, .. }));
+        });
+    }
+
+    /// Runtime-kernel §11.2: `/compact budget` is `budget` alone or with one number or `default`; anything else is a
+    /// focus.
+    #[test]
+    fn compact_budget_is_budget_and_one_number_or_default() {
+        assert_eq!(compact_budget("budget"), Some(BudgetArg::Show));
+        assert_eq!(compact_budget("BUDGET 60000"), Some(BudgetArg::Set(60_000)));
+        assert_eq!(compact_budget("Budget 60_000"), Some(BudgetArg::Set(60_000)));
+        assert_eq!(compact_budget("budget 60,000"), Some(BudgetArg::Set(60_000)));
+        assert_eq!(compact_budget("budget 60k"), Some(BudgetArg::Set(60_000)));
+        assert_eq!(compact_budget("budget Default"), Some(BudgetArg::Default));
+        assert_eq!(compact_budget("budget 0"), Some(BudgetArg::Default));
+        for focus in ["", "budget notes and the API", "budgeting", "the budget", "budget 60000 please", "budget -5", "budget 1e5"]
+        {
+            assert_eq!(compact_budget(focus), None, "{focus:?}");
+        }
+        with(|ctx| {
+            let set = run_command("/compact budget 60k", ctx);
+            assert!(matches!(set, CommandAction::CompactBudget { budget: BudgetArg::Set(60_000) }), "{set:?}");
+            let focus = run_command("/compact budget notes", ctx);
+            assert!(matches!(&focus, CommandAction::Compact { focus: Some(f) } if f == "budget notes"), "{focus:?}");
+        });
+        assert_eq!(context_budget_text(None, None, None), "Context budget: none (compaction is off).");
+        assert_eq!(context_budget_text(Some(100_000), None, Some(5)), "Context budget: 100000 tokens (the default).");
+        assert_eq!(
+            context_budget_text(Some(60_000), Some(60_000), Some(70_000)),
+            "Context budget: 60000 tokens (yours). The context (70000 tokens) is already past it: Marv compacts at your next message."
+        );
+        assert!(context_budget_text(Some(170_000), Some(900_000), None).contains("capped at 85%"));
+    }
+}

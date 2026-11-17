@@ -1,0 +1,15 @@
+{
+  "description": "An MCP server is configured but the task doesn't need it: its tools are only announced (deferred), and the run is a plain edit.",
+  "prompt": "Implement parseDuration in src/duration.js as its comment describes (\"1h30m\" gives 5400), and export it from src/index.js.",
+  "mcp": {
+    "server": "tracker",
+    "data": "tracker.json"
+  },
+  "config": {
+    "mcpTools": "deferred"
+  },
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `src/index.js` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
+}

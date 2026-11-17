@@ -1,0 +1,241 @@
+# Marv OS release: builds the Linux, macOS and Windows packages, smoke-tests them and, when not a dry run, publishes
+# a prerelease with the binaries only to Flologix/marv-os-releases. Started by hand (Actions > Kernel release > Run
+# workflow); a dry run is the default. Publishing needs the repository secret RELEASES_TOKEN: a fine-grained token with
+# Contents: read and write on Flologix/marv-os-releases only. Forks have neither and cannot publish.
+name: Kernel release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without os-v, e.g. 1.0.0-beta.1"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and smoke-test only: don't publish"
+        required: true
+        type: boolean
+        default: true
+      macos_only:
+        description: "Build only the macOS .dmg (GitHub-hosted, Apple silicon): skips the Linux build and never publishes"
+        required: true
+        type: boolean
+        default: false
+
+# One release at a time, and never one cancelled halfway through publishing.
+concurrency:
+  group: kernel-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Before the hour of building: a publishing run (a tag, or by hand with dry_run unticked) needs Kernel CI to have
+  # passed on the commit, on main. Kernel CI usually still runs when the tag is pushed, so this waits for it.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Kernel CI passed on this commit
+        if: ${{ !inputs.dry_run && !inputs.macos_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The push run on main: a commit main never had has none, and isn't released.
+          for _ in $(seq 70); do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push" \
+              --jq '.workflow_runs | sort_by(.created_at) | last | select(.) | "\(.status) \(.conclusion) \(.html_url)"')
+            case $run in
+              "") echo "no Kernel CI run on main for $GITHUB_SHA: release a commit on main"; exit 1 ;;
+              "completed success "*) echo "Kernel CI passed: ${run##* }"; exit 0 ;;
+              completed*) echo "Kernel CI didn't pass on $GITHUB_SHA ($run): fix or re-run it, then re-run this"; exit 1 ;;
+            esac
+            echo "waiting for Kernel CI: $run"; sleep 60
+          done
+          echo "Kernel CI still hasn't finished on $GITHUB_SHA"; exit 1
+
+  # The unsigned Apple-silicon .dmg. The only GitHub-hosted job, so it's lean:
+  # one runner, no Intel, cargo and npm cached. The release job below needs it and attaches what it uploads, so
+  # publishing happens in the release job below.
+  build-macos:
+    needs: gate
+    # macos-14 was retired by GitHub on 2026-11-07.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version=$INPUT_VERSION
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$' || {
+            echo "'$version' isn't a version like 1.0.0-beta.1"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: os-desktop-macos
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      # The plain `marv` CLI goes in the bundle at Contents/libexec/marv-os/marv (tauri.macos.conf.json): Marv chats
+      # and the sandboxed helpers look for it there (marv_sandbox::helper_exe::BUNDLED_HELPER). Signed ad hoc here,
+      # before the bundle: Tauri doesn't sign `bundle.macOS.files`, and the app's own signature then seals this file's
+      # hash, so `codesign --verify --deep --strict` below and the .dmg (made in the same step) both see it signed.
+      - name: Build marv
+        run: |
+          cargo build --release -p marv-cli
+          mkdir -p app/src-tauri/binaries
+          cp target/release/marv app/src-tauri/binaries/marv
+          chmod 755 app/src-tauri/binaries/marv
+          codesign --force --sign - app/src-tauri/binaries/marv
+          app/src-tauri/binaries/marv --version
+      # The Git tab runs lazygit: the .app brings its own (MIT) in Contents/MacOS, beside the desktop, for people who
+      # haven't installed it. Pinned and checked: a new version is a change here, its hash from the release's
+      # checksums.txt (darwin_arm64).
+      - name: Fetch lazygit
+        env:
+          LAZYGIT_VERSION: "0.66.2"
+          LAZYGIT_SHA256: "fadda59ae7665ba556fcbaa704c7eade6e40d016d3f3b25d6327dd1f3f906a0c"
+        run: |
+          tgz="lazygit_${LAZYGIT_VERSION}_darwin_arm64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tgz" "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/$tgz"
+          echo "$LAZYGIT_SHA256  $RUNNER_TEMP/$tgz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/lazygit" app/src-tauri/binaries
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/lazygit" lazygit LICENSE
+          cp "$RUNNER_TEMP/lazygit/lazygit" app/src-tauri/binaries/lazygit
+          cp "$RUNNER_TEMP/lazygit/LICENSE" app/src-tauri/binaries/lazygit-LICENSE.txt
+          chmod 755 app/src-tauri/binaries/lazygit
+          codesign --force --sign - app/src-tauri/binaries/lazygit
+          app/src-tauri/binaries/lazygit --version
+      # Unsigned: the config's ad hoc identity, no Developer ID (people open it once through System Settings,
+      # Privacy & Security, Open Anyway).
+      - name: Build the desktop (.app, .dmg)
+        working-directory: app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri build --bundles app,dmg --config "{\"version\":\"$VERSION\"}"
+      - name: Smoke test
+        run: |
+          app=target/release/bundle/macos/Marv.app
+          # The app's own binary by name: Contents/MacOS also holds lazygit.
+          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          bin="$app/Contents/MacOS/$exe"
+          [ "$(lipo -archs "$bin")" = arm64 ]
+          # The bundled agent and Git tab: present, executable, arm64, and they run.
+          for tool in "$app/Contents/libexec/marv-os/marv" "$app/Contents/MacOS/lazygit"; do
+            [ -x "$tool" ] || { echo "missing or not executable: $tool"; exit 1; }
+            [ "$(lipo -archs "$tool")" = arm64 ]
+            "$tool" --version
+          done
+          codesign --verify --deep --strict --verbose=2 "$app"
+          packaging/desktop/smoke-macos.sh "$app"
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="Marv_${VERSION}_aarch64.dmg"
+          mkdir -p dist
+          cp target/release/bundle/dmg/*.dmg "dist/$asset"
+          (cd dist && shasum -a 256 "$asset" >"$asset.sha256" && cat "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marv-os-macos
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # The unsigned Windows installer (Marv_<version>_x64-setup.exe), built and smoke-tested by windows.yml on a hosted
+  # Windows runner. Not in a macOS-only dry run.
+  build-windows:
+    needs: gate
+    if: github.event_name != 'workflow_dispatch' || !inputs.macos_only
+    uses: ./.github/workflows/windows.yml
+    with:
+      version: ${{ inputs.version }}
+
+  release:
+    # Not after a macOS-only dry run. A failed macOS or Windows build fails the run: a release never goes out without
+    # its .dmg and its installer.
+    needs: [build-macos, build-windows]
+    if: github.event_name != 'workflow_dispatch' || !inputs.macos_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # Outside the checkout, so checkout's clean doesn't throw away the build.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../.cargo-target
+      MARV_RELEASE_OUT: ${{ github.workspace }}/../os-release-out
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hosted runner setup
+        if: runner.environment == 'github-hosted'
+        uses: ./.github/actions/hosted-linux
+      - name: Fetch the macOS .dmg
+        uses: actions/download-artifact@v4
+        with:
+          name: marv-os-macos
+          path: ${{ github.workspace }}/../os-release-macos
+      - name: Fetch the Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: marv-os-windows
+          path: ${{ github.workspace }}/../os-release-windows
+      - name: Disk check
+        run: |
+          use=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+          echo "disk use ${use}%"
+          [ "$use" -lt 89 ] || { echo "disk above 88%: free space before building a release"; exit 1; }
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          HAS_RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN != '' }}
+        run: |
+          version=$INPUT_VERSION; publish=
+          [ "$INPUT_DRY_RUN" = true ] || publish=--publish
+          # Before the hour of building, not at the end of it.
+          if [ -n "$publish" ] && [ "$RUNNER_ENVIRONMENT" = github-hosted ] && [ "$HAS_RELEASES_TOKEN" != true ]; then
+            echo "publishing from a GitHub-hosted runner needs the RELEASES_TOKEN secret (no gh login here)"; exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "Marv OS $version ${publish:-(dry run)}"
+      - name: Checks (quick)
+        run: scripts/marv-os-check.sh --quick
+      - name: Build, smoke-test and publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+          # A fine-grained PAT with contents:write on marv-os-releases only; empty means the runner's own gh login.
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          MARV_RELEASE_MACOS_DIR: ${{ github.workspace }}/../os-release-macos
+          MARV_RELEASE_WINDOWS_DIR: ${{ github.workspace }}/../os-release-windows
+        run: |
+          # shellcheck disable=SC2086 # PUBLISH is empty or one flag
+          scripts/marv-os-release.sh "$VERSION" $PUBLISH
+      # Every run keeps what it made (the Linux AppImage, .deb and CLI, the .dmg, the Windows installer, SHA256SUMS and
+      # the notes) as one artifact: a published release's files also stay as a workflow artifact for a week.
+      # upload-artifact refuses a path with `..` in it: the files move into the workspace first.
+      - name: Gather the release files
+        if: always()
+        shell: bash
+        run: mkdir -p os-release-out && cp -a "$MARV_RELEASE_OUT"/. os-release-out/ 2>/dev/null || true
+      - name: Keep the release files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marv-os-${{ steps.version.outputs.version }}
+          path: os-release-out/*
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,934 @@
+//! The TUI's input boundary: what the engine tells the UI ([`UiEvent`]), what the UI asks of the
+//! engine ([`SessionPort`]), and the view-model types both speak. New in marv-rs (no single Marv
+//! file): in Marv the App imported `MarvSession` and the session's types directly
+//! (`src/session.ts` `SessionEvent`, `src/types.ts` `Message`/`Notice`, `src/tools/types.ts`
+//! `ApprovalRequest`/`DiffLine`, `src/provider/models.ts` `ModelInfo`, `src/sessions.ts`
+//! `SessionSummary`, `src/usage.ts` `Totals`).
+//!
+//! Why a boundary instead of `use marv_session::*`:
+//! - the engine and the TUI are built in parallel, and the TUI must not pin the engine's API;
+//! - `docs/ARCHITECTURE.md` plans a daemon + socket protocol later; these types are what would go
+//!   over it, so they are plain data built from `marv-core` types (no handles, no closures);
+//! - the engine stays UI-free: it maps its `SessionEvent`/`LoopEvent` into [`UiEvent`] in one place.
+//!
+//! Shapes mirror Marv's so the mapping is 1:1. [`Message`] keeps Marv's JSON field names because
+//! saved sessions store the transcript the user saw in exactly this shape (`Resumed.transcript`).
+//!
+//! **Text is raw here.** Every string that came from a model, a tool, a file, an MCP server or the
+//! mesh is stored as-is and cleaned with `printable()` by the component that draws it.
+
+use marv_core::{StopReason, Usage};
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------------------------
+// The transcript (Marv `src/types.ts`)
+// ---------------------------------------------------------------------------------------------
+
+/// Who a transcript entry is from. `System` is Marv's own notices (help text, errors), not the LLM
+/// system prompt; `Tool` is a tool call the agent made, shown with its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    System,
+    Tool,
+}
+
+/// A tool entry's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolState {
+    Running,
+    Done,
+    Error,
+    Declined,
+}
+
+/// Marv's `ToolStatus`: what a tool entry shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolStatus {
+    /// What it was called on, e.g. the file path.
+    pub label: String,
+    pub status: ToolState,
+    /// e.g. "42 lines", or the error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// A subagent's finished tool calls, shown with ctrl+o.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<String>>,
+    /// What a file change did (edit_file, write_file), drawn under the entry: collapsed, all with ctrl+o.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffShown>,
+}
+
+/// How important a notice is; its left bar, title and worst-of tone use its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoticeTone {
+    Info,
+    Warning,
+    Error,
+}
+
+/// One bullet of a notice: a short headline, then (optionally) indented detail lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeItem {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Vec<String>>,
+}
+
+/// A distinct, coloured block of startup and other issues (see `NoticeView`), transcript only,
+/// never sent to the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    pub title: String,
+    pub tone: NoticeTone,
+    pub items: Vec<NoticeItem>,
+}
+
+/// A single entry in the transcript the user sees (Marv's `Message`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: u64,
+    pub role: Role,
+    /// For `Tool`: the tool name.
+    pub text: String,
+    /// Renders a system message in the error colour.
+    #[serde(default, rename = "isError", skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    /// Render a system message as Markdown (lists get hanging indents).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub markdown: bool,
+    /// Renders a system message as a distinct notice block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<Notice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolStatus>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Diffs and approvals (Marv `src/tools/types.ts`; mirrors marv-tools' types field for field)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffKind {
+    Add,
+    Del,
+    Ctx,
+    /// Skipped unchanged lines between hunks ("…").
+    Gap,
+}
+
+/// One line of a diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    #[serde(default)]
+    pub text: String,
+    /// The line's number before the change (removed and unchanged lines).
+    #[serde(rename = "oldLine", default, skip_serializing_if = "Option::is_none")]
+    pub old_line: Option<usize>,
+    /// The line's number after the change (added and unchanged lines).
+    #[serde(rename = "newLine", default, skip_serializing_if = "Option::is_none")]
+    pub new_line: Option<usize>,
+}
+
+/// A change as the transcript shows it: at most MAX_SHOWN_DIFF lines, and how many more there were.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffShown {
+    pub lines: Vec<DiffLine>,
+    #[serde(default)]
+    pub more: usize,
+}
+
+/// What the approval prompt shows before a tool changes something.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preview {
+    /// "Edit src/app.ts", "Run a command".
+    pub title: String,
+    pub diff: Option<Vec<DiffLine>>,
+    /// A shell command, shown as "$ command".
+    pub command: Option<String>,
+    /// Plain text, e.g. a memory to save.
+    pub text: Option<String>,
+    /// A small detail line, e.g. "sandboxed · no network".
+    pub note: Option<String>,
+    /// Shown in the warning colour, e.g. "runs WITHOUT a sandbox".
+    pub warning: Option<String>,
+    /// Several files, each with its own diff (/undo: what goes back where).
+    pub files: Option<Vec<PreviewFile>>,
+}
+
+/// One file of [`Preview::files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewFile {
+    /// "Restore src/app.ts".
+    pub title: String,
+    pub diff: Option<DiffShown>,
+    /// "binary", "too large to show", "changed since".
+    pub note: Option<String>,
+}
+
+/// "Don't ask again this session" applies to everything with the same key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub key: String,
+    /// For the prompt: "Yes, and don't ask again for <description> this session".
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub tool: String,
+    pub label: String,
+    pub preview: Preview,
+    pub scope: Scope,
+    /// Which subagent is asking ("implementer · Task 2"); None for the main agent.
+    pub agent: Option<String>,
+    /// The action can reach the network (bash with network: true).
+    pub network: bool,
+    /// Yes or no only, no "don't ask again": each one is its own decision (/mcp add, a door to the host).
+    pub once: bool,
+    /// Asked every time whatever was answered before (a protected path, egress after untrusted content): an "always"
+    /// on another request never covers it, queued or not.
+    pub must_ask: bool,
+    /// The call leaves the sandbox through this door: the prompt shows its warning line (Marv Sprint 4).
+    pub door: Option<marv_core::Door>,
+    /// #185: the prompt offers "No, and say why": a model's tool call, whose result the reason becomes.
+    pub reason: bool,
+}
+
+/// Identifies one pending approval so the answer reaches the right waiter (parallel subagents can
+/// ask at once; the TUI queues them and shows the head).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApprovalId(pub u64);
+
+/// The user's answer. (`unavailable` is the headless approver's; the TUI never sends it.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Run it.
+    Yes,
+    /// Run it, and everything in its scope this session.
+    Always,
+    /// Don't; this stops the run so the user can say what to do instead.
+    No,
+    /// Don't, and tell the model why (#185): the call's result gives the reason, as typed, and the turn goes on.
+    /// Never a yes. (In the approval's choices it's the empty-reason item that opens the reason input.)
+    Declined(String),
+}
+
+// ---------------------------------------------------------------------------------------------
+// Status bar, pickers, setup
+// ---------------------------------------------------------------------------------------------
+
+/// The session's running totals (Marv `src/usage.ts` `Totals`), for the status bar's cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Totals {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
+    /// USD; None when neither reported nor estimable.
+    pub cost: Option<f64>,
+    /// Some of the cost was estimated from prices rather than reported (`~$`).
+    pub estimated: bool,
+    /// A local model (Ollama): no cost.
+    pub local: bool,
+}
+
+/// What the status bar shows besides the hint: the model, the folder and yolo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusInfo {
+    /// The provider/model name as the session reports it (`session.providerName`).
+    pub model: String,
+    /// For display, e.g. "~/Projects/app".
+    pub cwd: String,
+    /// Yolo mode is on: always shown, so the user knows what runs without asking.
+    pub yolo: bool,
+    /// The model's context window, when known (status bar `12.3k/32.8k ctx`).
+    pub context_length: Option<u64>,
+    /// Background processes running (Marv #51): shown whenever there are any, since they keep running between turns.
+    pub processes: usize,
+    /// Mesh messages waiting unread in Marv's inbox (runtime-kernel live UX): shown whenever there are any, until a
+    /// turn reads them. A count only, never who or what.
+    pub mail: usize,
+}
+
+/// One background process for the processes view (ctrl+p, or a click on "N running"). The command and output are the
+/// project's and the model's words: drawn through `printable()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessRow {
+    pub name: String,
+    /// The command it runs, as started.
+    pub command: String,
+    /// "running · http://localhost:4173 · up 2m", "exited (code 1) · up 5m".
+    pub status: String,
+    pub running: bool,
+}
+
+/// The answer to [`SessionPort::load_processes`]: every process, and the last lines of output of the one asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessesView {
+    pub rows: Vec<ProcessRow>,
+    /// The process the output is from, and that output (newest last); None when none was asked for or it's gone.
+    pub output: Option<(String, String)>,
+}
+
+/// What the welcome banner says was loaded at startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WelcomeInfo {
+    pub version: String,
+    pub cwd: String,
+    /// The instruction files the model has, as shown ("AGENTS.md", "~/.marv/AGENTS.md"; #62).
+    pub instructions: Vec<String>,
+    pub skills: usize,
+    pub memories: usize,
+    pub mcp_servers: usize,
+}
+
+/// Whether a model can reason before answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningMode {
+    /// Can be turned off.
+    Optional,
+    /// Can't (OpenRouter rejects trying).
+    Mandatory,
+}
+
+/// A model the picker can offer (Marv `ModelInfo`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Can call tools. None = unknown.
+    pub tools: Option<bool>,
+    /// USD per million tokens.
+    pub price_in: Option<f64>,
+    pub price_out: Option<f64>,
+    pub price_cache_read: Option<f64>,
+    pub context: Option<u64>,
+    /// Runs on this machine (Ollama).
+    pub local: bool,
+    pub reasoning: Option<ReasoningMode>,
+    /// #159: the name to show beside the id, when the list has one (ChatGPT's `display_name`).
+    pub name: Option<String>,
+}
+
+/// One saved session for `/resume` (Marv `SessionSummary`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    /// Unix ms.
+    pub updated_at: u64,
+    pub messages: usize,
+    pub model: String,
+}
+
+/// A saved session, brought back (Marv `Resumed`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resumed {
+    pub id: String,
+    pub updated_at: u64,
+    pub model: String,
+    /// What the user saw.
+    pub transcript: Vec<Message>,
+    pub totals: Totals,
+    /// The plan tool's list as it was saved (#15), pinned again.
+    pub plan: Option<Vec<PlanItem>>,
+}
+
+/// One item of the plan tool's checklist (Marv `src/tools/types.ts` `PlanItem`, #15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanItem {
+    pub text: String,
+    pub status: PlanStatus,
+}
+
+/// At most one item is `InProgress` at a time (the current item).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+/// The providers setup offers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProviderId {
+    OpenRouter,
+    Ollama,
+    /// #159: Z.ai's GLM Coding Plan.
+    Zai,
+    /// #159: Sign in with ChatGPT.
+    ChatGpt,
+    /// Kimi Code (a Kimi membership).
+    Kimi,
+    /// DeepSeek's API.
+    DeepSeek,
+    /// Alibaba Cloud's Coding Plan (Qwen models).
+    Qwen,
+    /// #278: a GGUF model on this machine, through llama.cpp.
+    LlamaCpp,
+    /// #275: one of the user's own endpoints (`"providers"` in the config), by name.
+    Custom(String),
+}
+
+/// What setup needs to know about a provider (Marv `PRESETS[provider]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPreset {
+    pub id: ProviderId,
+    pub label: String,
+    /// The environment variable holding its key, if it needs one.
+    pub key_env: Option<String>,
+    pub key_url: Option<String>,
+    pub default_model: String,
+    /// #159: the person signs in (ChatGPT) instead of pasting a key.
+    pub sign_in: bool,
+}
+
+/// Where setup starts: the whole wizard (first run, `/setup`) or just the model (`/model`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupStart {
+    FirstRun,
+    Reconfigure,
+    Model,
+}
+
+/// What the setup screen starts from. Keys arrive masked (`maskKey`): the full key never reaches
+/// the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupContext {
+    pub start: SetupStart,
+    pub presets: Vec<ProviderPreset>,
+    /// The saved provider and model; None on first run.
+    pub current: Option<(ProviderId, String)>,
+    /// The saved API key of each provider that has one, masked (#159: each provider has its own).
+    pub saved_keys: Vec<(ProviderId, String)>,
+    /// #159: the saved sign-ins (registrations) of providers that sign in, the one in use first.
+    pub accounts: Vec<(ProviderId, AccountInfo)>,
+    /// A key found in the environment for each provider, masked.
+    pub env_keys: Vec<(ProviderId, String)>,
+}
+
+/// #159: one saved sign-in (a ChatGPT registration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    /// What the engine knows it by (the issued client id).
+    pub id: String,
+    /// What's shown (an email).
+    pub label: String,
+    /// Signed in, with plan usage.
+    pub signed_in: bool,
+    /// The one in use.
+    pub active: bool,
+}
+
+/// #159: which registration a sign-in is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInTarget {
+    /// The one in use (a new registration when there's none).
+    Current,
+    /// A saved one, by id.
+    Account(String),
+    /// A new registration: another account.
+    New,
+}
+
+/// #159: how a sign-in is going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInProgress {
+    /// The browser was sent to this address (shown, in case it didn't open).
+    Started { url: String },
+    /// Signed in (who: an email, or "signed in"), or why not.
+    Done(Result<String, String>),
+}
+
+/// What the user chose in setup. `api_key: None` keeps the saved key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupAnswer {
+    pub provider: ProviderId,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
+/// A slash command for the `/` menu and the ctrl+k palette (#44): both are built from the one list
+/// [`SessionPort::commands`] returns, so a new command or skill shows up in both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandInfo {
+    /// Without the slash; may have words ("mcp login github") for argument completions.
+    pub name: String,
+    pub description: String,
+    /// A built-in command or a skill: the palette groups them apart.
+    pub kind: CommandKind,
+    /// The palette may run it while a reply streams (it only shows something, or changes a setting
+    /// from the next turn on). Everything else waits for an idle session.
+    pub while_busy: bool,
+}
+
+impl CommandInfo {
+    /// A built-in command that needs an idle session.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self { name: name.into(), description: description.into(), ..Self::default() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommandKind {
+    #[default]
+    Command,
+    Skill,
+}
+
+/// A setting the palette shows with its current value (#44): `Yolo: on`, `Model: z-ai/glm-5.3-flash`.
+/// The engine builds these from its settings table, next to the commands, and says what choosing one
+/// does as a command line, so the change goes the way the slash command goes (saved, announced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingInfo {
+    /// "Yolo", "Step limit".
+    pub name: String,
+    /// "on", "z-ai/glm-5.3-flash", "25".
+    pub value: String,
+    pub description: String,
+    pub action: SettingAction,
+    /// Choosing it is fine while a reply streams.
+    pub while_busy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingAction {
+    /// Run this command line: a toggle's flip (`/yolo off`) or a value's picker (`/model`).
+    Run(String),
+    /// Put this in the prompt for the user to finish (`/steps `).
+    Prefill(String),
+}
+
+/// A running subagent's state for its transcript entry (Marv `AgentProgress`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentProgress {
+    /// "worktree marv/x-1a2b · 3 tools · read_file src/a.ts"
+    pub line: String,
+    /// Its finished tool calls, newest last.
+    pub steps: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Events: engine → UI
+// ---------------------------------------------------------------------------------------------
+
+/// What a turn is doing between the model's replies (Marv `status` event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStatus {
+    WaitingForMcp,
+    Compacting,
+    Checking,
+    /// The turn's checkpoint is taking a while (#16): "Saving a checkpoint…".
+    Checkpointing,
+    Running,
+}
+
+/// How a turn ended: how the agent loop ended, or `Interrupted` before the loop began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEndReason {
+    Loop(StopReason),
+    Interrupted,
+}
+
+/// What an empty reply leads to (Marv `empty_reply.next`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyNext {
+    Retry,
+    Nudge,
+    Stop,
+}
+
+/// How a compaction went (Marv `CompactResult`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactOutcome {
+    /// `overflow` (#63): the recovery level when a request was too long for the window, else `None`.
+    Compacted {
+        summary: String,
+        tokens_before: Option<u64>,
+        overflow: Option<u32>,
+    },
+    NotCompacted {
+        reason: String,
+        error: String,
+    },
+}
+
+/// Everything the engine tells the UI. One enum, sent on one channel, so the UI's event loop has a
+/// single place to wake for engine work.
+///
+/// Turn events mirror Marv's `SessionEvent` (which includes the agent's `LoopEvent`s); a subagent's
+/// events arrive wrapped in [`UiEvent::Subagent`]. The rest are answers to [`SessionPort`] calls.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiEvent {
+    // --- a turn (Marv SessionEvent / LoopEvent) ---
+    /// Always first.
+    TurnStart {
+        turn: String,
+    },
+    /// After a turn: the user's likely next message, for the empty prompt (Tab takes it).
+    Suggestion(String),
+    Status(TurnStatus),
+    /// Streamed reply text. The UI batches these (see `app`: revealed at a pace, `REVEAL_MS`).
+    TextDelta(String),
+    /// The model's private reasoning, previewed by `ThinkingView`.
+    ThinkingDelta(String),
+    /// A tool call still streaming (display only), shown live by `DraftView`.
+    ToolCallDelta {
+        index: usize,
+        name: String,
+        text: String,
+    },
+    /// One step's reply text is complete.
+    Assistant {
+        text: String,
+    },
+    /// "Send now": the person's message went into the running turn, at a step boundary. It joins the transcript here.
+    SentNow {
+        text: String,
+    },
+    /// "Send now" messages that were never delivered (the turn ended first): they go back into the prompt.
+    NotSent {
+        texts: Vec<String>,
+    },
+    /// #184: the messages waiting for the running turn to finish, oldest first (all of them, after any change).
+    Queued(Vec<String>),
+    ToolStart {
+        call_id: String,
+        name: String,
+        label: String,
+    },
+    ToolEnd {
+        call_id: String,
+        name: String,
+        status: ToolStatus,
+    },
+    /// A call answered without running (after a no or an interrupt).
+    ToolSkipped {
+        call_id: String,
+        name: String,
+        output: String,
+    },
+    /// The latest request's usage plus the session totals.
+    Usage {
+        last: Usage,
+        totals: Totals,
+    },
+    Error(String),
+    StepLimit {
+        steps: u32,
+        continued: bool,
+    },
+    EmptyReply {
+        next: EmptyNext,
+    },
+    CutOff {
+        continued: bool,
+    },
+    TextLoop {
+        continued: bool,
+    },
+    /// #90: the reply announced its next step but made no tool call; Marv said continue.
+    AnnouncedStep {
+        continued: bool,
+    },
+    ToolLoop {
+        continued: bool,
+    },
+    Compacted,
+    Retry {
+        attempt: u32,
+        max: u32,
+        message: String,
+        continued: bool,
+    },
+    Done(StopReason),
+    /// A subagent's own event; `call_id` is the agent tool call that started it (its view's key).
+    Subagent {
+        call_id: String,
+        title: String,
+        event: Box<UiEvent>,
+    },
+    SubagentProgress {
+        call_id: String,
+        progress: AgentProgress,
+    },
+    /// The main agent's plan call ended (#15): its new list, empty when cleared. (Marv's App read `result.plan` off
+    /// the plan call's `tool_end`; subagents have no plan tool.)
+    Plan(Vec<PlanItem>),
+    /// An automatic (or `/compact`) compaction, and how it went.
+    Compaction {
+        automatic: bool,
+        outcome: CompactOutcome,
+    },
+    /// Always last, exactly once, however the turn ended.
+    TurnEnd {
+        turn: String,
+        reason: TurnEndReason,
+    },
+
+    // --- asks ---
+    /// A tool wants approval. The UI queues these and answers each with [`SessionPort::answer`].
+    Approval {
+        id: ApprovalId,
+        request: ApprovalRequest,
+    },
+    /// Nobody waits for that approval's answer any more (#201: another Marv asked for a wire and hung up, or gave up):
+    /// it leaves the queue unanswered.
+    ApprovalWithdrawn(ApprovalId),
+
+    // --- transcript and status from outside a turn ---
+    /// A message for the transcript: command output, a notice (startup, MCP, checks)...
+    Message(Message),
+    /// The model, folder, yolo or context window changed.
+    StatusInfo(StatusInfo),
+    /// What `ctrl+c`-to-exit / the welcome banner need, sent once at startup.
+    Welcome(WelcomeInfo),
+
+    // --- results of commands and port calls ---
+    /// `/clear`: empty the transcript (and the selection's remembered rows).
+    Clear,
+    /// `/setup`, `/model`, or first run.
+    OpenSetup(SetupContext),
+    /// `/resume` without an id: the picker's list, newest first.
+    Sessions(Vec<SessionSummary>),
+    /// The answer to [`SessionPort::load_models`].
+    Models(Result<Vec<ModelInfo>, String>),
+    /// #159: how a sign-in started with [`SessionPort::sign_in`] is going.
+    SignIn(SignInProgress),
+    /// A session was brought back: replace the transcript.
+    Resumed(Resumed),
+    /// A short-lived status bar message ("Copied 3 lines").
+    Flash(String),
+    /// Work outside a turn started or stopped (`/mcp add`'s lookup...): shows the waiting line.
+    Busy(Option<String>),
+    /// marv-rs #124: the mesh radio changed (on or off, who's on it): the strip above the prompt.
+    Radio(RadioView),
+    /// `/radio` with the radio on: the roster view, until Esc.
+    OpenRadio,
+    /// The answer to [`SessionPort::load_processes`], for the processes view.
+    Processes(ProcessesView),
+    /// `/exit`, or the engine is going away.
+    Exit,
+}
+
+/// The mesh radio as the TUI shows it (marv-rs #124). Names are checked mesh names; titles and projects are another
+/// Marv's user's words, drawn through `printable()` and never sent anywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RadioView {
+    pub on: bool,
+    /// This Marv's mesh name.
+    pub me: String,
+    /// This Marv's own title, as it goes out (empty with titles off).
+    pub my_title: String,
+    pub peers: Vec<RadioPeer>,
+    /// The last messages sent and received (phase 2), oldest first: the strip's flash and `/radio`'s traffic list.
+    pub traffic: Vec<RadioTraffic>,
+}
+
+/// One message on the radio, for the person's eyes only. The text is another Marv's (or this one's model's or
+/// person's) words: drawn through `printable()`, sent nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadioTraffic {
+    pub at_ms: u64,
+    /// `<sender>:<seq>`.
+    pub id: String,
+    /// Sent by this Marv.
+    pub outgoing: bool,
+    /// Received: its sender. Sent: its addressees (`*` for all).
+    pub peers: Vec<String>,
+    /// `user`, `model` or `marv`: shown, never believed.
+    pub by: String,
+    /// `msg`, `request`, `ack`, `done` or `failed` (#124, phase 3): fixed words.
+    pub kind: String,
+    /// The request it is or answers, short (`r17`); none for a `msg`.
+    pub request: Option<String>,
+    pub text: String,
+    /// Refused, and why (Marv's words).
+    pub refused: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadioPeer {
+    pub name: String,
+    pub state: RadioState,
+    pub title: String,
+    pub project: String,
+    pub pane: Option<String>,
+    /// When its state began.
+    pub since_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadioState {
+    Idle,
+    Working,
+    Waiting,
+    /// No heartbeat for 45 s: greyed.
+    Silent,
+    /// Left a moment ago (shown for 10 s).
+    Left,
+    /// Its link ended without a leave: crashed or killed.
+    Lost,
+}
+
+impl RadioState {
+    pub fn word(self) -> &'static str {
+        match self {
+            RadioState::Idle => "idle",
+            RadioState::Working => "working",
+            RadioState::Waiting => "waiting",
+            RadioState::Silent => "silent",
+            RadioState::Left => "left",
+            RadioState::Lost => "left (lost)",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests: UI → engine
+// ---------------------------------------------------------------------------------------------
+
+/// What the TUI asks of the engine. Implemented by marv-session (later, perhaps, by a socket
+/// client to a daemon).
+///
+/// Every method returns at once and must not block the UI thread: results come back as
+/// [`UiEvent`]s on the channel handed to [`crate::App::new`]. That keeps the UI's event loop the
+/// only place that waits, and keeps this trait object-safe without async-trait.
+pub trait SessionPort: Send + Sync {
+    /// The commands for the `/` menu (stable for the session; read once).
+    fn commands(&self) -> Vec<CommandInfo>;
+
+    /// The settings the ctrl+k palette lists, with their values as they are now (asked each time the
+    /// palette opens, so they're never stale).
+    fn settings(&self) -> Vec<SettingInfo> {
+        Vec::new()
+    }
+
+    /// Starts a turn with the user's message. A message while busy is the engine's to refuse
+    /// (it answers with a system [`UiEvent::Message`]); the UI also doesn't send one.
+    fn send(&self, text: String);
+    /// marv-rs: Ctrl+V with an image on the clipboard: saves it and returns its path, for the prompt (a message
+    /// attaches the images it names); or why it couldn't.
+    fn paste_image(&self) -> Result<String, String> {
+        Err("Pasting an image isn't available here: type or drag in the image's path instead.".into())
+    }
+
+    /// Alt+Enter while a turn runs ("send now"): `text` goes to the running turn at its next step boundary (after the
+    /// current reply and tool calls, before the next request), as the person's message. [`UiEvent::SentNow`] says
+    /// when it went in; [`UiEvent::NotSent`] gives back what never did.
+    fn send_now(&self, text: String) {
+        let _ = text;
+    }
+
+    /// Enter while a turn runs (#184): `text` waits in the queue and starts its own turn when the running one finishes.
+    /// The engine owns the queue (mesh-woken turns share it) and reports it with [`UiEvent::Queued`]. A turn that
+    /// was stopped (or failed) keeps the queue: nothing starts on its own until the person sends.
+    fn queue(&self, text: String) {
+        let _ = text;
+    }
+
+    /// Takes the newest queued message back out (↑ to edit it, ctrl+x to drop it). None: nothing queued (or it just
+    /// started).
+    fn unqueue_last(&self) -> Option<String> {
+        None
+    }
+
+    /// Takes the oldest queued message out, to send it now (Enter on an empty prompt, idle: the queue a stop kept).
+    fn take_queued(&self) -> Option<String> {
+        None
+    }
+
+    /// Runs a slash command line (`"/model"`, `"/mcp login github"`). Marv's commands are pure
+    /// functions returning an action; the engine applies the engine-side part (config, yolo,
+    /// memory, MCP) and sends the UI-side part as events (`Message`, `Clear`, `OpenSetup`,
+    /// `Sessions`, `Exit`, ...).
+    fn run_command(&self, line: String);
+
+    /// Answers one pending approval.
+    fn answer(&self, id: ApprovalId, decision: Decision);
+
+    /// Esc / ctrl+c: stop the running turn or command. The UI declines its queued approvals
+    /// itself (with [`answer`](Self::answer)) before calling this.
+    fn abort(&self);
+
+    /// Esc while idle: stop asking for the next-step suggestion, if that's still going (the prompt drops a late one
+    /// itself). Nothing else is running to stop.
+    fn stop_suggesting(&self) {}
+
+    /// The setup screen's model step needs the provider's list ([`UiEvent::Models`]).
+    fn load_models(&self, provider: ProviderId);
+
+    /// Setup finished: save the config and reconfigure the provider.
+    fn complete_setup(&self, answer: SetupAnswer);
+
+    /// #159: setup's sign-in step: open the browser and wait for the sign-in ([`UiEvent::SignIn`]).
+    fn sign_in(&self, _provider: ProviderId, _target: SignInTarget) {}
+
+    /// #159: setup switched to another saved sign-in: make it the one in use ([`UiEvent::SignIn`] when done).
+    fn use_account(&self, _provider: ProviderId, _id: String) {}
+
+    /// #159: setup closed while a sign-in waited: stop listening for it.
+    fn cancel_sign_in(&self) {}
+
+    /// #159: setup's "sign out": revoke and forget the provider's sign-in.
+    fn sign_out(&self, _provider: ProviderId) {}
+
+    /// The processes view is open: list the background processes, with the last lines of `output_of`'s output
+    /// ([`UiEvent::Processes`]). Asked again every second while the view stays open.
+    fn load_processes(&self, output_of: Option<String>) {
+        let _ = output_of;
+    }
+
+    /// The processes view's stop: stops that background process (the answer is a transcript message).
+    fn stop_process(&self, name: String) {
+        let _ = name;
+    }
+
+    /// `/resume` picked a session, or `marv -c` (`None` = the latest here).
+    fn resume(&self, id: Option<String>);
+
+    /// Before the process exits: save the session and flush the trajectory. The returned future is
+    /// awaited (bounded) after the terminal is restored.
+    fn flush(&self) -> futures::future::BoxFuture<'static, ()>;
+
+    /// A submitted line that is a login's callback address alone (Marv #18: pasted from a browser that couldn't reach
+    /// Marv's listener). It holds the authorization code, so the engine takes it for the waiting `/mcp login`, and it
+    /// never reaches the model, the prompt history or the transcript, even during a turn. True: the engine took it
+    /// (what happened comes back as events).
+    fn login_callback(&self, _text: &str) -> bool {
+        false
+    }
+
+    /// Whether `text` is such a callback, without taking it: the palette (#113) keeps a draft in the prompt history
+    /// only when it isn't one.
+    fn is_login_callback(&self, _text: &str) -> bool {
+        false
+    }
+
+    /// Whether something other than an empty prompt has the keyboard: the splash, setup, the session picker, the
+    /// ctrl+k palette, the radio's roster, or a half-typed slash command. Called when it changes. While it's held,
+    /// what's typed isn't a new prompt, so Herdr isn't told the agent is idle (a pane send types a prompt only).
+    fn keyboard_held(&self, _held: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_keeps_marv_json_field_names() {
+        let json = r#"{"id":3,"role":"tool","text":"edit_file","tool":{"label":"a.ts","status":"done","diff":{"lines":[{"kind":"add","text":"x","newLine":1}],"more":0}}}"#;
+        let message: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(message.role, Role::Tool);
+        assert_eq!(message.tool.as_ref().unwrap().diff.as_ref().unwrap().lines[0].new_line, Some(1));
+        assert_eq!(serde_json::to_string(&message).unwrap(), json);
+        let system: Message = serde_json::from_str(r#"{"id":1,"role":"system","text":"x","isError":true}"#).unwrap();
+        assert!(system.is_error);
+    }
+}

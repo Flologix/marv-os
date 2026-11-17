@@ -1,0 +1,575 @@
+//! The seam between Marv and any LLM vendor. Ports `src/provider/types.ts` (the trait) and
+//! `src/provider/index.ts` (`createProvider`, `reasoningFor`).
+//!
+//! Every adapter turns its own streaming format into [`marv_core::ProviderEvent`]s; the agent
+//! loop and the UI only ever see those, so adding a vendor never touches them.
+//!
+//! - [`create_provider`] is the **only** place that maps a config to a concrete [`Provider`]
+//!   (Marv `CLAUDE.md`, "createProvider"). OpenRouter goes through [`openai_compat`], Ollama
+//!   through its native API ([`ollama`]), because only the native API can set `num_ctx`.
+//! - Errors never surface as `Err`: an adapter yields [`ProviderEvent::Error`] with a message the
+//!   user can act on ([`errors`]), and SDK sessions name the option to change ([`errors::SDK_HINTS`]).
+//! - Z.ai's GLM Coding Plan (#159) goes through [`openai_compat`] too, on the plan's coding endpoint
+//!   ([`models::ZAI_CODING_BASE_URL`]) with the plan's own key; so do Kimi Code, DeepSeek and Qwen's Coding Plan, each
+//!   on its own endpoint with its own key.
+//! - `/think` on OpenRouter is its unified `reasoning: { enabled }` switch, decided by
+//!   [`reasoning_for`] from what the model list says ([`models::ReasoningSupport`]).
+//! - Marv's `Config`/`PRESETS`/`resolveConfig` live in `marv-session`; this crate only takes the
+//!   resolved, provider-relevant part of it ([`ProviderConfig`]), so the dependency arrow keeps
+//!   pointing from session to provider.
+
+use std::pin::Pin;
+use std::sync::Arc;
+
+use futures::Stream;
+use marv_core::{ChatTurn, ProviderEvent, ToolChoice, ToolSpec};
+use tokio_util::sync::CancellationToken;
+
+pub mod chatgpt;
+pub mod degenerate;
+pub mod endpoint;
+pub mod errors;
+pub mod factory;
+pub mod models;
+pub mod offered;
+pub mod ollama;
+pub mod openai_compat;
+pub mod quota;
+pub mod responses;
+pub mod retry;
+pub mod sse;
+
+pub use errors::ErrorHints;
+pub use factory::{ProviderFactory, ProviderOption};
+pub use models::{ModelInfo, ReasoningSupport};
+
+/// A stream of provider events for one request.
+pub type EventStream = Pin<Box<dyn Stream<Item = ProviderEvent> + Send>>;
+
+/// Per-request options.
+#[derive(Debug, Clone, Default)]
+pub struct StreamOptions {
+    /// Instructions sent ahead of the conversation. Built once per session and byte-stable.
+    pub system: Option<String>,
+    /// Tools the model may call. Same list and order on every request (prompt cache).
+    pub tools: Vec<ToolSpec>,
+    /// `None` for the wrap-up reply at the step limit; the tools are still sent so the cached
+    /// prefix holds (Marv #59). Ollama has no `tool_choice`: it relies on the note, and the loop
+    /// answers any call it makes anyway with "Not run".
+    pub tool_choice: ToolChoice,
+    /// Cancelled by ctrl+c to stop the reply and the HTTP request behind it.
+    pub cancel: CancellationToken,
+    /// #90: when on, the adapter collects the raw response payloads and sends them back on the
+    /// [`marv_core::ProviderEvent::Usage`] event, for the trajectory's `request` record. Off by
+    /// default; the session turns it on from `MARV_DEBUG_RAW`.
+    pub debug_raw: bool,
+    /// marv-rs: the most reasoning effort this one request may use, for a provider set to more (the agent loop's retry
+    /// after a reply that spent its whole output budget reasoning, Terminal-Bench 2026-11-06 `dna-insert`). Only ever
+    /// lowers an effort the provider sends: one it doesn't send isn't added, so no model gets a level it may refuse.
+    /// Effort is a request setting, not part of the prompt, so the cached prefix holds (the messages, the system prompt
+    /// and the tools keep their bytes). `None`: the provider's own setting. Ollama has no effort and ignores it.
+    pub effort_cap: Option<ReasoningEffort>,
+}
+
+pub trait Provider: Send + Sync {
+    /// Shown in the status bar, e.g. "openrouter · z-ai/glm-5.3".
+    fn name(&self) -> &str;
+    /// Context window in tokens, when known (Ollama: the `num_ctx` Marv asks for).
+    fn context_length(&self) -> Option<u64>;
+    /// Streams one reply. Never fails up front: errors arrive as [`ProviderEvent::Error`].
+    ///
+    /// The returned stream is `'static`: an adapter serializes `history` into its request body
+    /// before returning, so the caller may append to its history while the reply streams.
+    fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream;
+}
+
+/// Which built-in provider a config names. A saved provider Marv no longer knows (the removed
+/// `echo`) is dropped by `marv-session` on load, which reopens setup; it never reaches here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    OpenRouter,
+    Ollama,
+    /// #159: Z.ai's GLM Coding Plan, a subscription, through its OpenAI-compatible coding endpoint.
+    Zai,
+    /// #159: Sign in with ChatGPT: the person's ChatGPT plan, through the Responses API ([`chatgpt`]).
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
+    /// Kimi Code: a Kimi membership, through its OpenAI-compatible coding endpoint.
+    Kimi,
+    /// DeepSeek's own API, pay as you go.
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    /// Alibaba Cloud Model Studio's Coding Plan: Qwen models on the plan's own endpoint.
+    Qwen,
+    /// #275: an endpoint named in the user's config ([`endpoint::Endpoint`], in [`ProviderConfig::endpoint`]).
+    Custom,
+    /// #278: a GGUF model on this machine, through a `llama-server` Marv starts and stops (`marv-session`'s
+    /// `local_model`), spoken to as an endpoint ([`ProviderConfig::endpoint`]).
+    #[serde(rename = "llamacpp")]
+    LlamaCpp,
+}
+
+impl ProviderKind {
+    /// The id recorded with sessions and trajectories ("openrouter", "ollama", "zai").
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::Ollama => "ollama",
+            Self::Zai => "zai",
+            Self::ChatGpt => "chatgpt",
+            Self::Kimi => "kimi",
+            Self::DeepSeek => "deepseek",
+            Self::Qwen => "qwen",
+            // The endpoint's own name is what's recorded ([`factory::ConfigFactory::id`]); this is the kind.
+            Self::Custom => "custom",
+            Self::LlamaCpp => "llamacpp",
+        }
+    }
+
+    /// Used in error messages ("OpenRouter rejected the API key…"). Marv: `PRESETS[provider].label`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::Ollama => "Ollama",
+            Self::Zai => "Z.ai",
+            Self::ChatGpt => "ChatGPT",
+            Self::Kimi => "Kimi",
+            Self::DeepSeek => "DeepSeek",
+            Self::Qwen => "Qwen",
+            Self::Custom => "The custom provider",
+            Self::LlamaCpp => "llama.cpp",
+        }
+    }
+}
+
+/// The provider-relevant part of Marv's resolved `Config` (built by `marv-session`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderConfig {
+    pub provider: ProviderKind,
+    pub model: String,
+    /// OpenRouter: `https://openrouter.ai/api/v1`; Ollama: `http://localhost:11434` (a trailing
+    /// `/v1` is ignored by the Ollama adapter).
+    pub base_url: String,
+    /// OpenRouter only.
+    pub api_key: Option<String>,
+    /// Ollama's configured window (the upper bound for `num_ctx`; default 32768 in config).
+    pub context_length: u64,
+    /// `/think`: off by default (local thinking models can otherwise reason for minutes).
+    pub thinking: bool,
+    /// `reasoningEffort` (marv-rs #143): how hard an OpenRouter model reasons, where it reasons at all.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// #159: the ChatGPT sign-in's token file (`<config dir>/chatgpt.json`); `None` for the other providers.
+    pub auth_file: Option<std::path::PathBuf>,
+    /// #275: the custom provider, resolved (its key included); `None` for the built-in ones.
+    pub endpoint: Option<std::sync::Arc<endpoint::Endpoint>>,
+}
+
+/// OpenRouter's unified reasoning setting, as sent in the request body: `{"enabled": bool}` or `{"effort": "low"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ReasoningSwitch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl ReasoningSwitch {
+    pub const ON: Self = Self { enabled: Some(true), effort: None };
+    pub const OFF: Self = Self { enabled: Some(false), effort: None };
+    pub fn effort(effort: ReasoningEffort) -> Self {
+        Self { enabled: None, effort: Some(effort) }
+    }
+}
+
+/// OpenRouter's reasoning effort levels (marv-rs #143). `xhigh` and `max` are the levels above `high` that some
+/// models take (OpenRouter lists DeepSeek V4.1 Flash's as max, high, low and none, 2026-11-01): sent as named, so a
+/// model that doesn't take one may refuse the request. Which a model takes is in OpenRouter's model list
+/// (`reasoning.supported_efforts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const NAMES: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+/// The effort to send `model`: the highest level it takes at or below `requested` (the default is `max`: as high as
+/// each model goes), else its lowest; `high` when its levels aren't known, which nearly every reasoning model takes
+/// (sending one it doesn't take can get the request refused). DeepSeek V4.1 Flash takes max, high and low, not the
+/// old default medium.
+pub fn effort_for_model(requested: Option<ReasoningEffort>, efforts: Option<&[ReasoningEffort]>) -> Option<ReasoningEffort> {
+    let requested = requested?;
+    match efforts {
+        Some(levels) if !levels.is_empty() => {
+            Some(levels.iter().copied().filter(|&l| l <= requested).max().unwrap_or_else(|| levels[0]))
+        }
+        _ => Some(requested.min(ReasoningEffort::High)),
+    }
+}
+
+/// `/think` on OpenRouter. "Off" goes only to models whose reasoning is optional: for one that
+/// always reasons, OpenRouter rejects the request (and thinking is off by default, so that would
+/// be every request). For a model Marv knows nothing about yet (the model list hasn't loaded),
+/// nothing is sent.
+///
+/// `effort` (`reasoningEffort`, marv-rs #143) goes wherever the model reasons: with `/think` on, and to a model that
+/// always reasons. Without it, a model that always reasons picks its own effort, and GLM-5.3-flash's own is far
+/// more than coding needs (on SWE-bench, 4x the output tokens Codex got from the same model at medium).
+pub fn reasoning_for(
+    thinking: bool,
+    effort: Option<ReasoningEffort>,
+    reasoning: Option<ReasoningSupport>,
+) -> Option<ReasoningSwitch> {
+    let reasoning = reasoning?;
+    let reasons = thinking || reasoning == ReasoningSupport::Mandatory;
+    match effort {
+        Some(effort) if reasons => Some(ReasoningSwitch::effort(effort)),
+        _ if thinking => Some(ReasoningSwitch::ON),
+        _ => (reasoning == ReasoningSupport::Optional).then_some(ReasoningSwitch::OFF),
+    }
+}
+
+/// #159: the ChatGPT provider's options. The token goes only to OpenAI's public API ([`chatgpt::API_BASE_URL`]),
+/// whatever `baseUrl` the config names, and the token file must be an absolute path (a relative or empty one would
+/// read whatever file the working folder has).
+pub fn chatgpt_options(config: &ProviderConfig, hints: ErrorHints) -> Result<responses::ResponsesOptions, String> {
+    let path = config.auth_file.clone().filter(|p| p.is_absolute()).ok_or_else(|| {
+        "ChatGPT: Marv doesn't know where the sign-in is kept (set HOME or MARV_CONFIG_DIR), so it can't sign the request."
+            .to_string()
+    })?;
+    Ok(responses::ResponsesOptions {
+        name: format!("chatgpt · {}", config.model),
+        label: ProviderKind::ChatGpt.label().into(),
+        base_url: chatgpt::API_BASE_URL.into(),
+        model: config.model.clone(),
+        credentials: chatgpt::ChatGptCredentials::new(chatgpt::AuthStore { path }),
+        headers: Vec::new(),
+        // OpenAI's Responses API takes up to high for these models: xhigh and max are sent as high.
+        reasoning_effort: config.reasoning_effort.map(|e| e.min(ReasoningEffort::High)),
+        encrypted_reasoning: true,
+        max_output_tokens: None,
+        // The route's preview takes function tools only grouped in a namespace.
+        tool_namespace: Some(responses::MARV_TOOLS),
+        // The account's model list gives no window: Marv's table, or a safe default.
+        context_length: Some(chatgpt::context_window(&config.model)),
+        hints,
+        timing: Default::default(),
+        idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+        // #266: one per provider (a session, or a /model switch), random: names no person or machine.
+        prompt_cache_key: Some(format!("marv-{}", chatgpt::random_token())),
+        body: serde_json::Map::new(),
+    })
+}
+
+/// #275: the provider for a custom endpoint and one of its models.
+fn custom_provider(
+    endpoint: &endpoint::Endpoint,
+    model: &str,
+    shown: &str,
+    info: Option<&ModelInfo>,
+    hints: ErrorHints,
+) -> Arc<dyn Provider> {
+    let name = format!("{} · {shown}", endpoint.name);
+    let context_length = endpoint.context_length.or(info.and_then(|m| m.context));
+    match endpoint.wire {
+        endpoint::Wire::OpenAiChat => Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+            name,
+            label: endpoint.name.clone(),
+            base_url: endpoint.base_url.clone(),
+            model: model.to_string(),
+            api_key: endpoint.api_key.clone(),
+            headers: endpoint.headers.clone(),
+            body: endpoint.extra_body.clone(),
+            offline_hint: None,
+            hints,
+            timing: Default::default(),
+            idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+            max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
+            context_length,
+        })),
+        endpoint::Wire::OpenAiResponses => Arc::new(responses::ResponsesProvider::new(responses::ResponsesOptions {
+            name,
+            label: endpoint.name.clone(),
+            base_url: endpoint.base_url.clone(),
+            model: model.to_string(),
+            credentials: Arc::new(responses::ApiKey(endpoint.api_key.clone().unwrap_or_default())),
+            headers: endpoint.headers.clone(),
+            reasoning_effort: None,
+            encrypted_reasoning: false,
+            max_output_tokens: None,
+            tool_namespace: None,
+            context_length,
+            hints,
+            timing: Default::default(),
+            idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+            prompt_cache_key: Some(format!("marv-{}", chatgpt::random_token())),
+            body: endpoint.extra_body.clone(),
+        })),
+    }
+}
+
+/// A provider that can't be made: every request ends with `message` (it never fails up front, as the trait says).
+pub struct FailingProvider {
+    pub name: String,
+    pub message: String,
+}
+
+impl Provider for FailingProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn context_length(&self) -> Option<u64> {
+        None
+    }
+
+    fn stream(&self, _history: &[ChatTurn], _options: StreamOptions) -> EventStream {
+        Box::pin(futures::stream::iter([ProviderEvent::Error(self.message.clone())]))
+    }
+}
+
+/// The one place that maps a config to a concrete [`Provider`]. `model`: what the model list says
+/// about it (its reasoning support, and #96 its output limit). `hints`: what a bad key or an unknown model
+/// tells the user to change (the TUI's commands by default; the SDK passes [`errors::SDK_HINTS`]).
+///
+/// - OpenRouter: [`openai_compat::OpenAiCompatProvider`] named `openrouter · <model>`, with the
+///   `X-Title: Marv` attribution header and, when [`reasoning_for`] says so, `body.reasoning`;
+///   `max_tokens` from [`openai_compat::max_tokens_for`] (#96) and the idle timeout (#88).
+/// - Ollama: [`ollama::OllamaProvider`] with `context_length` and `thinking` from the config.
+pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints: Option<ErrorHints>) -> Arc<dyn Provider> {
+    let hints = hints.unwrap_or_default();
+    match config.provider {
+        ProviderKind::OpenRouter => {
+            let mut body = serde_json::Map::new();
+            let effort = effort_for_model(config.reasoning_effort, model.and_then(|m| m.efforts.as_deref()));
+            if let Some(reasoning) = reasoning_for(config.thinking, effort, model.and_then(|m| m.reasoning)) {
+                body.insert("reasoning".into(), serde_json::json!(reasoning));
+            }
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("openrouter · {}", config.model),
+                label: ProviderKind::OpenRouter.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                // Optional attribution: shows "Marv" in your OpenRouter activity log.
+                headers: vec![("X-Title".into(), "Marv".into())],
+                body,
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                // #96: so the provider ends a runaway reply. Ollama has its own cap (`num_predict`).
+                max_tokens: Some(openai_compat::max_tokens_for_reasoning(model.and_then(|m| m.max_output), effort)),
+                // #116: so max_tokens is clamped to the room the prompt leaves in the window.
+                context_length: model.and_then(|m| m.context),
+            }))
+        }
+        // #159: the GLM Coding Plan on Z.ai's coding endpoint, with the plan's own key. Its models always reason
+        // (`thinking: disabled` is refused), so neither `/think` nor a reasoning switch is sent; `tool_stream` asks for
+        // tool calls in fragments, as OpenRouter streams them (without it they come whole at the end).
+        ProviderKind::Zai => {
+            let mut body = serde_json::Map::new();
+            body.insert("tool_stream".into(), serde_json::Value::Bool(true));
+            let known = models::zai_models().into_iter().find(|m| m.id == config.model);
+            let info = model.or(known.as_ref());
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("zai · {}", config.model),
+                label: ProviderKind::Zai.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                headers: Vec::new(),
+                body,
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
+                context_length: info.and_then(|m| m.context),
+            }))
+        }
+        // Kimi Code, DeepSeek and Qwen's Coding Plan: OpenAI-compatible, each with its own key, and nothing sent about
+        // reasoning (each model uses its own default). Kimi asks tools to name themselves, hence the User-Agent.
+        ProviderKind::Kimi | ProviderKind::DeepSeek | ProviderKind::Qwen => {
+            let known = models::table_for(config.provider).and_then(|t| t.into_iter().find(|m| m.id == config.model));
+            let info = model.or(known.as_ref());
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("{} · {}", config.provider.id(), config.model),
+                label: config.provider.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                headers: vec![("User-Agent".into(), concat!("Marv/", env!("CARGO_PKG_VERSION")).into())],
+                body: serde_json::Map::new(),
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
+                context_length: info.and_then(|m| m.context),
+            }))
+        }
+        // #159: the person's ChatGPT plan, through the Responses API with the sign-in's token. The route refuses
+        // `max_output_tokens` and sampling fields, so none are sent; the reasoning effort is, with a summary.
+        ProviderKind::ChatGpt => match chatgpt_options(config, hints) {
+            Ok(options) => Arc::new(responses::ResponsesProvider::new(options)),
+            Err(why) => Arc::new(FailingProvider { name: format!("chatgpt · {}", config.model), message: why }),
+        },
+        // #275: an endpoint from the user's config, through the adapter for its wire, with its key, headers and extra
+        // body fields. Nothing about reasoning is sent unless the config's extra body says so: Marv can't know what
+        // the endpoint's models take.
+        ProviderKind::Custom | ProviderKind::LlamaCpp => match config.endpoint.as_deref() {
+            Some(endpoint) => match &endpoint.problem {
+                Some(why) => {
+                    Arc::new(FailingProvider { name: format!("{} · {}", endpoint.name, config.model), message: why.clone() })
+                }
+                None => {
+                    // #278: a local model is a file's path; the status bar shows its name.
+                    let shown = match config.provider {
+                        ProviderKind::LlamaCpp => {
+                            std::path::Path::new(&config.model).file_stem().and_then(|s| s.to_str()).unwrap_or(&config.model)
+                        }
+                        _ => &config.model,
+                    };
+                    let provider = custom_provider(endpoint, &config.model, shown, model, hints);
+                    match &endpoint.ready {
+                        Some(ready) => Arc::new(endpoint::ReadyFirst { ready: ready.clone(), inner: provider }),
+                        None => provider,
+                    }
+                }
+            },
+            None => Arc::new(FailingProvider {
+                name: format!("custom · {}", config.model),
+                message: "The custom provider isn't in ~/.marv/config.json's \"providers\" any more: pick another with /setup."
+                    .into(),
+            }),
+        },
+        // Ollama's native API, so the context window can be set (its default is 4096 tokens).
+        ProviderKind::Ollama => Arc::new(ollama::OllamaProvider::new(ollama::OllamaOptions {
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            context_length: config.context_length,
+            // Only a model that lists the thinking capability: Ollama refuses `think` from one that doesn't, and
+            // thinking is on by default (0.15.0).
+            thinking: config.thinking && model.is_some_and(|m| m.reasoning.is_some()),
+            hints,
+            timing: Default::default(),
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Ported from tests/provider-index.test.ts (there checked through the request body).
+
+    #[test]
+    fn think_on_turns_reasoning_on_for_models_that_can_reason() {
+        let on = Some(ReasoningSwitch::ON);
+        assert_eq!(reasoning_for(true, None, Some(ReasoningSupport::Optional)), on);
+        assert_eq!(reasoning_for(true, None, Some(ReasoningSupport::Mandatory)), on);
+    }
+
+    #[test]
+    fn think_off_turns_it_off_only_where_it_is_optional() {
+        assert_eq!(reasoning_for(false, None, Some(ReasoningSupport::Optional)), Some(ReasoningSwitch::OFF));
+        assert_eq!(reasoning_for(false, None, Some(ReasoningSupport::Mandatory)), None);
+    }
+
+    #[test]
+    fn for_an_unknown_model_nothing_is_sent_either_way() {
+        assert_eq!(reasoning_for(true, None, None), None);
+        assert_eq!(reasoning_for(false, None, None), None);
+        assert_eq!(reasoning_for(true, Some(ReasoningEffort::Low), None), None);
+    }
+
+    /// #143: the effort goes wherever the model reasons; thinking off on an optional model stays off.
+    #[test]
+    fn an_effort_goes_where_the_model_reasons() {
+        let low = Some(ReasoningEffort::Low);
+        assert_eq!(
+            reasoning_for(false, low, Some(ReasoningSupport::Mandatory)),
+            Some(ReasoningSwitch::effort(ReasoningEffort::Low))
+        );
+        assert_eq!(
+            reasoning_for(true, low, Some(ReasoningSupport::Optional)),
+            Some(ReasoningSwitch::effort(ReasoningEffort::Low))
+        );
+        assert_eq!(reasoning_for(false, low, Some(ReasoningSupport::Optional)), Some(ReasoningSwitch::OFF));
+    }
+
+    #[test]
+    fn chatgpt_requests_go_only_to_openais_api_with_an_absolute_token_file() {
+        let config = ProviderConfig {
+            provider: ProviderKind::ChatGpt,
+            model: "gpt-6.1-sol".into(),
+            base_url: "https://evil.example/v1".into(),
+            api_key: Some("sk-or".into()),
+            context_length: 0,
+            thinking: false,
+            reasoning_effort: None,
+            auth_file: Some("/home/u/.marv/chatgpt.json".into()),
+            endpoint: None,
+        };
+        let options = chatgpt_options(&config, ErrorHints::default()).unwrap();
+        // #266: a prompt cache key, the same for this provider's requests and different for the next provider.
+        let key = options.prompt_cache_key.clone().unwrap();
+        assert!(key.starts_with("marv-") && key.len() <= 64, "{key}");
+        assert_ne!(chatgpt_options(&config, ErrorHints::default()).unwrap().prompt_cache_key, Some(key));
+        assert_eq!(options.base_url, chatgpt::API_BASE_URL);
+        assert_eq!(options.tool_namespace, Some(responses::MARV_TOOLS));
+        for bad in [None, Some(std::path::PathBuf::new()), Some("chatgpt.json".into())] {
+            assert!(
+                chatgpt_options(&ProviderConfig { auth_file: bad.clone(), ..config.clone() }, ErrorHints::default()).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_switch_serializes_like_openrouter_expects() {
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::OFF).unwrap(), r#"{"enabled":false}"#);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Medium)).unwrap(), r#"{"effort":"medium"}"#);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Max)).unwrap(), r#"{"effort":"max"}"#);
+        use ReasoningEffort::{High, Low, Max, Medium, Xhigh};
+        let deepseek = [Low, High, Max];
+        assert_eq!(effort_for_model(Some(Max), Some(&deepseek)), Some(Max));
+        assert_eq!(effort_for_model(Some(Medium), Some(&deepseek)), Some(Low), "the highest it takes at or below");
+        assert_eq!(effort_for_model(Some(Xhigh), Some(&deepseek)), Some(High));
+        assert_eq!(effort_for_model(Some(Max), Some(&[Low, High])), Some(High), "where max isn't offered");
+        assert_eq!(effort_for_model(Some(ReasoningEffort::Minimal), Some(&deepseek)), Some(Low), "else its lowest");
+        assert_eq!(effort_for_model(Some(Max), None), Some(High), "levels unknown: high");
+        assert_eq!(effort_for_model(Some(Low), None), Some(Low));
+        assert_eq!(effort_for_model(None, Some(&deepseek)), None);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Xhigh)).unwrap(), r#"{"effort":"xhigh"}"#);
+        for name in ReasoningEffort::NAMES {
+            assert_eq!(ReasoningEffort::parse(name).map(ReasoningEffort::as_str), Some(name), "{name}");
+        }
+        for name in ReasoningEffort::NAMES {
+            assert_eq!(ReasoningEffort::parse(name).unwrap().as_str(), name);
+        }
+    }
+}

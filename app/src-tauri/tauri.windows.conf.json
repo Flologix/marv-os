@@ -1,0 +1,22 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "binaries/marv.exe": "marv.exe",
+      "binaries/lazygit.exe": "lazygit.exe",
+      "binaries/lazygit-LICENSE.txt": "lazygit-LICENSE.txt",
+      "binaries/conpty.dll": "conpty.dll",
+      "binaries/OpenConsole.exe": "OpenConsole.exe",
+      "windows/ConPTY-LICENSE.txt": "ConPTY-LICENSE.txt"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "windows/installer-hooks.nsh",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}
