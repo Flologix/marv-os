@@ -209,7 +209,10 @@ export interface ChatShape {
 
 /** backend.ts's `AgentRow`, as far as the roster reads it. */
 export interface AgentShape {
+  name?: string;
   chat?: string;
+  /** What its own Marv says it is doing (Activity's state). */
+  state?: "sleeping" | "loading" | "idle" | "busy" | "waiting";
   live: { core?: string; processes?: { kind: string; name: string; alive?: boolean }[] };
 }
 
@@ -256,8 +259,12 @@ export function roster(
     const chat = chats.find((c) => c.id === id);
     if (!chat) continue;
     const state = live.find((l) => l.id === id);
-    const { tone, word } = chatTone(state);
-    const agent = agents.find((a) => a.chat === id);
+    // A terminal Marv's own door knows when it asks or works (Activity's row); the desktop's live state of a chat
+    // whose agent runs in its terminal sees only its screen, and said idle beside a command prompt.
+    const agent = agents.find((a) => a.chat === id) ?? agents.find((a) => a.chat === undefined && a.name?.endsWith(`-${id.slice(0, 8)}`));
+    let { tone, word } = chatTone(state);
+    if (agent?.state === "waiting" && tone !== "waiting") [tone, word] = ["waiting", "needs you"];
+    else if (agent?.state === "busy" && (tone === "idle" || tone === "sleeping")) [tone, word] = ["working", "working"];
     const overlap = overlaps.find((o) => o.chat === id);
     const editing = (overlap?.with ?? []).flatMap((w) => w.paths.map((p) => `${p} (also: ${w.name})`));
     const processes = (agent?.live.processes ?? [])
@@ -271,7 +278,7 @@ export function roster(
       word,
       model: agent?.live.core ?? chat.settings?.model ?? "",
       writes: chat.writes ?? null,
-      waiting: state?.waiting ?? 0,
+      waiting: Math.max(state?.waiting ?? 0, agent?.state === "waiting" ? 1 : 0),
       editing,
       processes,
       report: lastReport({ id }, replies),

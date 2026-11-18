@@ -790,6 +790,103 @@ async fn an_unasked_git_write_commits_but_cant_reach_what_git_runs() {
     assert_eq!(approver.requests().len(), 1);
 }
 
+/// **The same in a git worktree (Linux).** A team member's chat works in a worktree whose `.git` is a file, with the
+/// repository in the hidden home. Its `git_write` command commits, branches and merges without asking, with the
+/// repository's `.git` writable and, on top (`GitWrite::{read_only_on_top, on_top_then}`, mounted in that order): the
+/// config, hooks, `info`, `modules`, the whole `worktrees` folder (every other worktree's record) read-only; the
+/// worktree's own folder in it writable again; its `commondir`, `gitdir` and `config.worktree`, and the project's `.git`
+/// file read-only. A command can't plant a hook or a config, repoint the worktree, or touch another worktree's record,
+/// and asks nothing; a `.git` file that doesn't check out (`gitdir: /elsewhere`) still asks.
+///
+/// Proven: dropped the `on_top_then` binds in `sandbox_args` → failed (a commit couldn't write the worktree's index);
+/// made `plan_worktree` leave the admin folder's `gitdir` out → failed (`gitdir` rewritten); left the project's `.git`
+/// file out of the read-only mounts → failed (the `.git` file rewritten); left `worktrees` out of the read-only mounts
+/// → failed (another worktree's record rewritten).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unasked_git_write_in_a_worktree_commits_but_cant_reach_what_git_runs_or_the_pointers() {
+    require_bwrap!();
+    let (top, home) = (TempDir::new("wt-write"), TempDir::outside_tmp("wt-write-home"));
+    let main = top.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        assert!(std::process::Command::new("git").args(args).current_dir(dir).status().unwrap().success(), "{args:?}");
+    };
+    let id = ["-c", "user.email=a@b", "-c", "user.name=n"];
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &[id.as_slice(), &["commit", "-qm", "1", "--allow-empty"]].concat());
+    git(&main, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(main.join("side.txt"), "s\n").unwrap();
+    git(&main, &["add", "side.txt"]);
+    git(&main, &[id.as_slice(), &["commit", "-qm", "side"]].concat());
+    git(&main, &["checkout", "-q", "main"]);
+    let (wt, wt2) = (top.path().join("wt"), top.path().join("wt2"));
+    git(&main, &["worktree", "add", "-q", "-b", "team/a", wt.to_str().unwrap()]);
+    git(&main, &["worktree", "add", "-q", "-b", "team/b", wt2.to_str().unwrap()]);
+    let common = std::fs::canonicalize(main.join(".git")).unwrap();
+    let admin = common.join("worktrees/wt");
+    let other = common.join("worktrees/wt2");
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+    let before = [common.join("config"), wt.join(".git"), admin.join("gitdir"), admin.join("commondir"), other.join("HEAD")]
+        .map(|p| (read(&p), p));
+    let approver = Recorder::new(Decision::No);
+    let mut ctx = ToolContext { approve_sandboxed: true, approver: Some(approver.clone()), ..ToolContext::new(&wt) };
+    ctx.sandbox = Arc::new(sandbox_with_home(home.path()));
+    let run = |command: String| {
+        let call = call("bash", json!({"command": command, "git_write": true}));
+        let ctx = ctx.clone();
+        async move { run_tool(&call, &ctx, builtin_tools()).await }
+    };
+    let out = run(format!(
+        "echo a > f && git add f && git {i} commit -qm two && git branch x && git {i} merge -q --no-ff -m merged side \
+         && git log --oneline | wc -l",
+        i = id.join(" ")
+    ))
+    .await;
+    assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+    assert!(out.result.output.starts_with("4\n"), "{}", out.result.output);
+    // Past the guess at setup commands (it looks for `.git/config` and the like in the command): `cd` first, so the
+    // read-only mounts are what stop them.
+    let (c, w) = (common.display(), wt.display());
+    for planted in [
+        format!("cd {c} && echo '[core]' >> config"),
+        format!("cd {c} && echo evil > hooks/pre-commit"),
+        format!("cd {c} && echo '* filter=x' > info/attributes"),
+        format!("cd {c} && echo /tmp/evil > commondir"),
+        format!("cd {c} && cd worktrees && echo x > wt2/HEAD"),
+        format!("cd {c} && cd worktrees && echo x > wt2/gitdir"),
+        format!("cd {c} && cd worktrees/wt && echo x > commondir"),
+        format!("cd {c} && cd worktrees/wt && echo x > gitdir"),
+        format!("cd {c} && cd worktrees/wt && echo '[core]' > config.worktree"),
+        format!("echo 'gitdir: /tmp/x' > {w}/.git"),
+        format!("cd {c} && cd worktrees && mv wt wt.old"),
+        format!("cd {c} && rm -rf worktrees"),
+    ] {
+        let out = run(planted.clone()).await;
+        assert!(!out.result.output.ends_with("[exit code 0]"), "{planted}: {}", out.result.output);
+    }
+    assert!(approver.requests().is_empty(), "none of those asked");
+    for (text, path) in &before {
+        assert_eq!(&read(path), text, "{}", path.display());
+    }
+    assert!(!common.join("hooks/pre-commit").exists() && !common.join("info/attributes").exists());
+    for gone in [common.join("commondir"), common.join("config.worktree"), admin.join("config.worktree"), common.join("modules")]
+    {
+        assert!(!gone.exists(), "{}", gone.display());
+    }
+    // The commit and the branch are the repository's own.
+    let list = std::process::Command::new("git").args(["branch", "--list", "x"]).current_dir(&main).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "x");
+    // A `.git` file that doesn't check out asks, as before.
+    let bad = TempDir::new("wt-write-bad");
+    bad.write(".git", "gitdir: /elsewhere\n");
+    let approver = Recorder::new(Decision::No);
+    let ask = ToolContext { approve_sandboxed: true, approver: Some(approver.clone()), ..ToolContext::new(bad.path()) };
+    let ask = ToolContext { sandbox: Arc::new(sandbox_with_home(home.path())), ..ask };
+    run_tool(&call("bash", json!({"command": "git commit -qam x", "git_write": true})), &ask, builtin_tools()).await;
+    assert_eq!(approver.requests().len(), 1);
+}
+
 /// **Protected files a command creates** (bwrap can only mount what exists): a new `.envrc`, a nested `AGENTS.md`,
 /// a nested `.git` are found after the command by `protected::scan_created` and removed by `revert_created`.
 ///

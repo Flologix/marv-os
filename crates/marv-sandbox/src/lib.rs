@@ -186,6 +186,8 @@ pub struct CommandMounts {
     pub read_only: Vec<PathBuf>,
     pub writable: Vec<PathBuf>,
     pub read_only_on_top: Vec<PathBuf>,
+    /// See [`SandboxOptions::on_top_then`].
+    pub on_top_then: Vec<(PathBuf, bool)>,
     pub placeholders: Vec<PathBuf>,
     pub project_read_only: bool,
     /// Mounts of their own (the process door's relay, Marv #51).
@@ -250,6 +252,7 @@ impl Sandbox {
                 .cloned()
                 .collect(),
             read_only_on_top: mounts.read_only_on_top.clone(),
+            on_top_then: mounts.on_top_then.clone(),
             placeholders: mounts.placeholders.clone(),
             project_read_only: mounts.project_read_only,
             // In the home folder the project is read-only (bwrap.rs), so there's nothing to protect on top of it, and

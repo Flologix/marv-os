@@ -159,6 +159,48 @@ pub fn remove(repo: &Path, wt: &ChatWorktree) -> Result<(), String> {
     Ok(())
 }
 
+/// What deleting a chat did with its worktree.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Cleanup {
+    /// Nothing in it that the folder's branch lacks: the worktree and branch are gone.
+    Removed,
+    /// Kept, for this reason (work only the worktree has, or git couldn't say): the person's to merge or discard.
+    Kept(String),
+}
+
+/// A deleted chat's worktree and branch, taken away like **Discard** does, but only when nothing is lost: no commits the
+/// folder's branch lacks, no file changed or new in the worktree. Anything else, or any git call that fails, keeps it
+/// (the chat's record goes either way, so the note says where the work is).
+pub fn remove_if_clean(repo: &Path, wt: &ChatWorktree) -> Cleanup {
+    let status = match status_of(repo, wt, true) {
+        Ok(s) => s,
+        Err(e) => return Cleanup::Kept(format!("Branch {} and its worktree are kept: {e}", wt.branch)),
+    };
+    let kept = |why: String| {
+        Cleanup::Kept(format!(
+            "Branch {} is kept ({why}), in {}: merge it, or remove it with git worktree remove and git branch -D.",
+            wt.branch,
+            top(wt)
+        ))
+    };
+    if status.into.is_none() {
+        return kept("the folder isn't on a branch, so what it has beside it can't be told".into());
+    }
+    match (status.commits, status.uncommitted) {
+        (0, 0) => match remove(repo, wt) {
+            Ok(()) => Cleanup::Removed,
+            Err(e) => Cleanup::Kept(format!("Branch {} is kept: {e}", wt.branch)),
+        },
+        (c, 0) => kept(format!("{c} commit{} not merged yet", if c == 1 { "" } else { "s" })),
+        (0, u) => kept(format!("{u} file{} changed and not committed", if u == 1 { "" } else { "s" })),
+        (c, u) => kept(format!(
+            "{c} commit{} not merged yet and {u} file{} not committed",
+            if c == 1 { "" } else { "s" },
+            if u == 1 { "" } else { "s" }
+        )),
+    }
+}
+
 /// **Merge**: worktree `wt`'s work (its uncommitted changes committed first, as chat `title`'s) merged into the folder's
 /// branch at `repo`, then the worktree and branch removed. Refused, with nothing changed, while the folder has changes
 /// not committed or isn't on a branch; a merge that conflicts is undone, the branch and worktree kept. What it did.
@@ -305,6 +347,32 @@ mod tests {
             top: String::new(),
         };
         (tmp, repo, wt)
+    }
+
+    /// A deleted chat's worktree goes only when it holds nothing the folder's branch lacks.
+    #[test]
+    fn a_deleted_chats_worktree_goes_only_when_clean() {
+        let (_tmp, repo, wt) = repo_and_worktree("wt-delete");
+        let dir = Path::new(&wt.dir);
+        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
+        assert!(matches!(remove_if_clean(&repo, &wt), Cleanup::Kept(why) if why.contains("1 file")), "an uncommitted file");
+        assert!(dir.exists());
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-qm", "b"]);
+        assert!(matches!(remove_if_clean(&repo, &wt), Cleanup::Kept(why) if why.contains("1 commit not merged")), "a commit");
+        assert!(dir.exists() && git(&repo, &["rev-parse", "--verify", "marv/task-1a2b"]).is_ok());
+        run(&repo, &["merge", "-q", "marv/task-1a2b"]);
+        assert_eq!(remove_if_clean(&repo, &wt), Cleanup::Removed, "merged and clean");
+        assert!(!dir.exists(), "its worktree is removed");
+        assert!(git(&repo, &["rev-parse", "--verify", "marv/task-1a2b"]).is_err(), "its branch is removed");
+    }
+
+    /// A worktree nothing was done in goes with its chat.
+    #[test]
+    fn an_untouched_worktree_goes_with_its_chat() {
+        let (_tmp, repo, wt) = repo_and_worktree("wt-delete-clean");
+        assert_eq!(remove_if_clean(&repo, &wt), Cleanup::Removed);
+        assert!(!Path::new(&wt.dir).exists());
     }
 
     /// Merge commits what the chat left uncommitted, merges its branch, and takes the worktree and branch away.

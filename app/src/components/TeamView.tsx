@@ -206,7 +206,7 @@ export function TeamView({
       </div>
       {notice && <p className="notice">{notice}</p>}
       <h2 className="place-h spaced">Board</h2>
-      {rule !== undefined ? <Board rule={rule} /> : <p className="faint place-empty">No rule, so no board.</p>}
+      {team.rules.length > 0 ? <Board rules={team.rules} /> : <p className="faint place-empty">No rule, so no board.</p>}
     </section>
   );
 }

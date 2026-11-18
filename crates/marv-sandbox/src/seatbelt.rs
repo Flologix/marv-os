@@ -521,6 +521,13 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     for (i, path) in plan.read_only_on_top.iter().enumerate() {
         b.paths("deny file-write*", &["literal", "subpath"], &format!("READ_ONLY_ON_TOP_{i}"), &canonical(path, fs), None);
     }
+    // Then, in order, each over the ones before (the later rule wins): a worktree's own git folder writable again, its
+    // pointers read-only again. Only Linux makes these (`git_guard::git_write_guard`); rendered all the same.
+    for (i, (path, writable)) in plan.on_top_then.iter().enumerate() {
+        let (op, kinds): (&str, &[&str]) =
+            if *writable { (write, &["subpath"]) } else { ("deny file-write*", &["literal", "subpath"]) };
+        b.paths(op, kinds, &format!("ON_TOP_THEN_{i}"), &canonical(path, fs), None);
+    }
     b.paths(write, &["subpath"], "TMP", &tmp, None);
     // Hard links (see HARD_LINK_OP): none out of the home or the shared temporary folders; then, only with
     // ALLOW_LINKS_IN_PROJECT, allowed in the project and the private TMPDIR, which may sit inside those; what in them
@@ -1658,6 +1665,7 @@ mod tests {
             read_only: vec!["/srv/ro".into()],
             writable: vec!["/srv/rw".into()],
             read_only_on_top: vec!["/srv/rw/config".into()],
+            on_top_then: vec![("/srv/rw/config/inner".into(), true)],
             placeholders: vec!["/Users/me/proj/.git".into()],
             project_read_only: false,
             protected: vec!["/Users/me/proj/.envrc".into()],
@@ -1679,6 +1687,7 @@ mod tests {
             read_only,
             writable,
             read_only_on_top,
+            on_top_then,
             placeholders,
             project_read_only,
             protected,
@@ -1706,6 +1715,7 @@ mod tests {
             ("READ_ONLY_0", &read_only[0]),
             ("WRITABLE_0", &writable[0]),
             ("READ_ONLY_ON_TOP_0", &read_only_on_top[0]),
+            ("ON_TOP_THEN_0", &on_top_then[0].0),
             ("PLACEHOLDER_0", &placeholders[0]),
             ("PROTECTED_0", &protected[0]),
             ("PLUG", mesh_socket.as_ref().unwrap()),

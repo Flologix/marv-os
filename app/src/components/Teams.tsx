@@ -224,7 +224,7 @@ export function Teams({
         </section>
         <section>
           <h2 className="place-h">Board{rule ? ` · ${ruleName(rule)}` : ""}</h2>
-          {rule && rule.mode !== "watch" ? <Board rule={rule.id} /> : <p className="faint place-empty">No rules, so no boards: a rule's chats share one.</p>}
+          {rule && rule.mode !== "watch" ? <Board rules={[rule.id]} /> : <p className="faint place-empty">No rules, so no boards: a rule's chats share one.</p>}
         </section>
       </div>
   );

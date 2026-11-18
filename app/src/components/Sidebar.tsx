@@ -1,4 +1,5 @@
 import { ask } from "@tauri-apps/plugin-dialog";
+import { say } from "../lib/dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { harnessTitle } from "../lib/harness";
 import { type AgentRow, type AppInfo, type ChatRecord, type Entry, type LiveChat, desktop } from "../lib/backend";
@@ -216,12 +217,15 @@ export function Sidebar({
   async function removeChat(chat: ChatRecord) {
     if (!(await ask(`Delete the chat "${chat.title}"? The folder's files stay.`, { title: "Marv", kind: "warning" }))) return;
     setError(null);
+    let kept: string | null = null;
     try {
-      await desktop.deleteChat(chat.id);
+      kept = await desktop.deleteChat(chat.id);
     } catch (e) {
       setError(String(e));
       return;
     }
+    // Its worktree had work only it has: kept, and said so.
+    if (kept) void say(kept, { title: "Marv" });
     forget(chat.id);
     // Its kept terminals (the agent's and the Git tab's) end with it.
     forgetTerm(`chat:${chat.id}`);

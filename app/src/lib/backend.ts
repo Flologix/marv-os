@@ -107,7 +107,8 @@ export interface MeshRules {
 
 /** One entry on a rule's team board (runtime-kernel §19): `by` a chat's mesh name, or empty for you. */
 export interface BoardEntry {
-  id: number;
+  /** Where it is kept: [rule, entry id] (your post to a team's boards is kept in each, shown once). */
+  refs: [number, number][];
   by: string;
   kind: "claim" | "note" | "done";
   text: string;
@@ -116,7 +117,7 @@ export interface BoardEntry {
 }
 
 export interface Board {
-  rule: number;
+  rules: number[];
   entries: BoardEntry[];
   /** Why the board can't be read, if it can't. */
   problem: string | null;
@@ -737,7 +738,8 @@ export const desktop = {
   /** Each member's latest report-back to the team's lead (from the lead's saved conversation), for the Team view. */
   teamReports: (lead: string, ids: string[]) => invoke<{ chat: string; text: string }[]>("team_reports", { lead, ids }),
   renameChat: (id: string, title: string) => invoke<void>("rename_chat", { id, title }),
-  deleteChat: (id: string) => invoke<void>("delete_chat", { id }),
+  /** A note when the chat's worktree and branch were kept (work only they have). */
+  deleteChat: (id: string) => invoke<string | null>("delete_chat", { id }),
   /** Your click: other chats can't (or can again) read this one, whatever the rules. */
   setChatPrivate: (id: string, priv: boolean) => invoke<void>("set_chat_private", { id, private: priv }),
   /** Your pick of a chat's permission mode, from its next start; the mode it will run with (a home folder holds it
@@ -820,10 +822,11 @@ export const desktop = {
     invoke<MeshRules>("allow_folder", { rel, lasts, keepWorking, read, worktrees }),
   revokeRule: (id: number) => invoke<MeshRules>("revoke_rule", { id }),
   /** Runtime-kernel §19: a rule's team board (~/.marv/mesh/boards/<rule>.json); your post (as you) and your Clear. */
-  board: (rule: number) => invoke<Board>("board", { rule }),
-  boardPost: (rule: number, kind: string, text: string) => invoke<Board>("board_post", { rule, kind, text }),
-  /** One entry, or (no `entry`) the whole board. */
-  boardClear: (rule: number, entry?: number) => invoke<Board>("board_clear", { rule, entry }),
+  /** Several rules' boards as one (a team in worktrees has one per pair of its folders); your post goes to each. */
+  board: (rules: number[]) => invoke<Board>("board", { rules }),
+  boardPost: (rules: number[], kind: string, text: string) => invoke<Board>("board_post", { rules, kind, text }),
+  /** One entry (its `refs`), or (no `entry`) every one of these boards. */
+  boardClear: (rules: number[], entry?: [number, number][]) => invoke<Board>("board_clear", { rules, entry }),
   /** Your grants (~/.marv/mesh/grants.json): chats that keep working while you're away. */
   chatGrants: () => invoke<ChatGrants>("chat_grants"),
   revokeGrant: (id: number) => invoke<ChatGrants>("revoke_grant", { id }),

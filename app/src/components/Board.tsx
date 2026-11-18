@@ -11,37 +11,39 @@ function age(atMs: number) {
 /**
  * A rule's team board (runtime-kernel §19): what the chats under it posted (claims, notes, done), who and when. Chats
  * read it with board_read; a post wakes nobody. You post as yourself and clear any entry; entries go after 24 hours.
- * Shown in Teams and in a chat's dock (kernel #53).
+ * Shown in Teams and in a chat's dock (kernel #53). `rules`: more than one for a team in worktrees (a board per pair of
+ * its folders), shown as one; your post goes to each.
  */
-export function Board({ rule, compact }: { rule: number; compact?: boolean }) {
+export function Board({ rules, compact }: { rules: number[]; compact?: boolean }) {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [kind, setKind] = useState("note");
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  const key = rules.join(",");
   useEffect(() => {
     setBoard(null);
-    const load = () => void desktop.board(rule).then(setBoard, (e) => setError(String(e)));
+    const load = () => void desktop.board(rules).then(setBoard, (e) => setError(String(e)));
     load();
     const timer = setInterval(load, 5000);
     return () => clearInterval(timer);
-  }, [rule]);
+  }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function post() {
     if (!text.trim()) return;
     setError(null);
     try {
-      setBoard(await desktop.boardPost(rule, kind, text));
+      setBoard(await desktop.boardPost(rules, kind, text));
       setText("");
     } catch (e) {
       setError(String(e));
     }
   }
 
-  async function clear(entry?: number) {
+  async function clear(entry?: [number, number][]) {
     if (entry === undefined && !(await ask("Clear this board? Every entry on it goes.", { title: "Marv", kind: "warning" }))) return;
     try {
-      setBoard(await desktop.boardClear(rule, entry));
+      setBoard(await desktop.boardClear(rules, entry));
     } catch (e) {
       setError(String(e));
     }
@@ -52,13 +54,13 @@ export function Board({ rule, compact }: { rule: number; compact?: boolean }) {
     <div className={`board${compact ? " compact" : ""}`}>
       {board && entries.length === 0 && <p className="faint board-empty">empty: chats post here what they're on (board_post)</p>}
       {entries.map((e) => (
-        <div key={e.id} className="board-entry" title={e.paths.length ? `paths: ${e.paths.join(", ")}` : undefined}>
+        <div key={e.refs.join("|")} className="board-entry" title={e.paths.length ? `paths: ${e.paths.join(", ")}` : undefined}>
           <span className="board-meta">
             <span className={`board-kind ${e.kind}`}>{e.kind}</span>{" "}
             <span className="muted">
               {e.by ? e.by : <span className="board-you" title="You posted this, from the desktop">you</span>} · {age(e.atMs)}
             </span>
-            <button className="icon-btn danger" title="Clear this entry" onClick={() => void clear(e.id)}>
+            <button className="icon-btn danger" title="Clear this entry" onClick={() => void clear(e.refs)}>
               ×
             </button>
           </span>

@@ -347,7 +347,7 @@ function BoardTab({ chatId, meshName }: { chatId: string; meshName: string | nul
           </select>
         </div>
       )}
-      <Board rule={chosen.id} compact />
+      <Board rules={[chosen.id]} compact />
     </>
   );
 }

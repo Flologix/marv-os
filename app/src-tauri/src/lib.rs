@@ -362,7 +362,7 @@ fn work_root(chat: &Chat) -> Result<(PathBuf, Option<String>), String> {
 /// was deleted, or the worktree is gone; never because its grant ended): the record forgets it, and the conversation
 /// it had there (saved under the worktree, so it can't be resumed from the folder) with it; git forgets worktrees
 /// whose folders are gone (`git worktree prune`). The worktree and its branch, if still there, are the person's to
-/// merge or remove: nothing here deletes them.
+/// merge or remove: nothing here deletes them (deleting a chat does, when nothing is lost: `delete_chat`).
 fn end_worktree(desktop: &Desktop, id: &str) {
     let Some(chat) = desktop.chats().into_iter().find(|c| c.id == id) else { return };
     if chat.worktree.is_none() {
@@ -1051,9 +1051,34 @@ fn set_chat_private(desktop: State<'_, Desktop>, id: String, private: bool) -> R
     Ok(())
 }
 
+/// Deleting a chat in its own worktree takes the worktree and its branch with it when nothing in them is lost (no commits
+/// the folder's branch lacks, no change left uncommitted, [`worktrees::remove_if_clean`]); else they stay and the answer
+/// says so (Merge or Discard, or git, are then the way). What it says, if anything.
 #[tauri::command]
-async fn delete_chat(desktop: State<'_, Desktop>, terminals: State<'_, terminals::Terminals>, id: String) -> Result<(), String> {
-    remove_chat(&desktop, &terminals, &id).await
+async fn delete_chat(
+    desktop: State<'_, Desktop>,
+    terminals: State<'_, terminals::Terminals>,
+    id: String,
+) -> Result<Option<String>, String> {
+    let mut note = None;
+    // A delegate works in its parent's worktree: only the parent's deletion takes it.
+    if let Some(chat) = desktop.chats().into_iter().find(|c| c.id == id)
+        && chat.delegated_by.is_none()
+        && let Some(wt) = chat.worktree.clone()
+    {
+        // Its agent stops first: nothing writes in the worktree while it is looked at and removed.
+        end_delegates(&desktop, &terminals, &id);
+        terminals.close_key(&format!("chat:{id}"));
+        desktop.live.stop(&id);
+        let folder = PathBuf::from(&chat.folder);
+        note = match tauri::async_runtime::spawn_blocking(move || worktrees::remove_if_clean(&folder, &wt)).await {
+            Ok(worktrees::Cleanup::Kept(why)) => Some(why),
+            Ok(worktrees::Cleanup::Removed) => None,
+            Err(e) => Some(e.to_string()),
+        };
+    }
+    remove_chat(&desktop, &terminals, &id).await?;
+    Ok(note)
 }
 
 /// Chat `id` goes: its grant revoked (first: if it can't be, nothing else is done and the person is told), its agent
@@ -3543,10 +3568,11 @@ fn board_store() -> Result<marv_kernel::BoardStore, String> {
 }
 
 /// One board entry, as the Mesh panel's Board tab shows it.
-#[derive(Serialize)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct BoardEntryView {
-    id: u64,
+    /// Where it is kept: (rule, entry id). More than one when the person's post went to several boards of a team.
+    refs: Vec<(u64, u64)>,
     /// The chat's mesh name, or empty for you.
     by: String,
     kind: String,
@@ -3558,74 +3584,121 @@ struct BoardEntryView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BoardView {
-    rule: u64,
+    rules: Vec<u64>,
     entries: Vec<BoardEntryView>,
-    /// Why the board can't be read, if it can't.
+    /// Why a board can't be read, if one can't.
     problem: Option<String>,
 }
 
-fn board_now(rule: u64) -> Result<BoardView, String> {
-    let (entries, problem) = match board_store()?.read(marv_kernel::PolicyId(rule), now_ms()) {
-        Ok(entries) => (entries, None),
-        Err(e) => (Vec::new(), Some(e.to_string())),
-    };
-    let entries = entries
-        .into_iter()
-        .map(|e| BoardEntryView {
-            id: e.id,
-            by: match e.by {
-                marv_kernel::BoardBy::Chat(name) => name,
-                marv_kernel::BoardBy::Person => String::new(),
-            },
-            kind: e.kind.word().into(),
-            text: e.text,
-            paths: e.paths,
-            at_ms: e.at_ms,
-        })
-        .collect();
-    Ok(BoardView { rule, entries, problem })
+/// The entries of several boards as one, oldest first. Your own post to a team's boards is one entry kept in each
+/// (same time, kind and text): shown once, with every place it is kept.
+fn merge_boards(boards: Vec<(u64, Vec<marv_kernel::BoardEntry>)>) -> Vec<BoardEntryView> {
+    let mut out: Vec<BoardEntryView> = Vec::new();
+    for (rule, entries) in boards {
+        for e in entries {
+            let person = matches!(e.by, marv_kernel::BoardBy::Person);
+            let kind: String = e.kind.word().into();
+            if person
+                && let Some(same) =
+                    out.iter_mut().find(|o| o.by.is_empty() && o.at_ms == e.at_ms && o.kind == kind && o.text == e.text)
+            {
+                same.refs.push((rule, e.id));
+                continue;
+            }
+            out.push(BoardEntryView {
+                refs: vec![(rule, e.id)],
+                by: match e.by {
+                    marv_kernel::BoardBy::Chat(name) => name,
+                    marv_kernel::BoardBy::Person => String::new(),
+                },
+                kind,
+                text: e.text,
+                paths: e.paths,
+                at_ms: e.at_ms,
+            });
+        }
+    }
+    out.sort_by_key(|e| e.at_ms);
+    out
 }
 
-/// A rule's team board, for the Mesh panel's Board tab.
-#[tauri::command]
-fn board(rule: u64) -> Result<BoardView, String> {
-    board_now(rule)
+fn board_now(rules: &[u64]) -> Result<BoardView, String> {
+    let store = board_store()?;
+    let now = now_ms();
+    let mut boards = Vec::new();
+    let mut problem = None;
+    for rule in rules {
+        match store.read(marv_kernel::PolicyId(*rule), now) {
+            Ok(entries) => boards.push((*rule, entries)),
+            Err(e) => problem = Some(e.to_string()),
+        }
+    }
+    Ok(BoardView { rules: rules.to_vec(), entries: merge_boards(boards), problem })
 }
 
-/// The person's post to a rule's board (as "you"): logged with its size, never its text.
+/// The team boards of `rules` as one (a team in worktrees has one board per pair of its folders: the Teams screen
+/// reads them all), for the Mesh panel's Board tab.
 #[tauri::command]
-async fn board_post(desktop: State<'_, Desktop>, rule: u64, kind: String, text: String) -> Result<BoardView, String> {
+fn board(rules: Vec<u64>) -> Result<BoardView, String> {
+    board_now(&rules)
+}
+
+/// The person's post (as "you") to each of `rules`' boards, so every chat under any of them reads it: logged with its
+/// size, never its text. Refused only when no board took it.
+#[tauri::command]
+async fn board_post(desktop: State<'_, Desktop>, rules: Vec<u64>, kind: String, text: String) -> Result<BoardView, String> {
     let kind = kind.parse::<marv_kernel::BoardKind>()?;
-    let entry = marv_kernel::NewEntry { by: marv_kernel::BoardBy::Person, kind, text, paths: Vec::new() };
-    let marv_kernel::Posted { entry: kept, .. } =
-        board_store()?.post(marv_kernel::PolicyId(rule), entry, now_ms()).await.map_err(|e| e.to_string())?;
-    if let Some(log) = desktop.event_log() {
-        let event = marv_kernel::KernelEvent::BoardPost {
-            rule: marv_kernel::PolicyId(rule),
-            by: None,
-            kind: kept.kind,
-            size: kept.text.len(),
-            paths_count: kept.paths.len(),
-        };
-        log.append(now_ms(), event);
+    let store = board_store()?;
+    // One time for all of them: the merged view shows the post once.
+    let now = now_ms();
+    let mut failed = None;
+    let mut posted = 0;
+    for rule in &rules {
+        let entry = marv_kernel::NewEntry { by: marv_kernel::BoardBy::Person, kind, text: text.clone(), paths: Vec::new() };
+        match store.post(marv_kernel::PolicyId(*rule), entry, now).await {
+            Ok(marv_kernel::Posted { entry: kept, .. }) => {
+                posted += 1;
+                if let Some(log) = desktop.event_log() {
+                    let event = marv_kernel::KernelEvent::BoardPost {
+                        rule: marv_kernel::PolicyId(*rule),
+                        by: None,
+                        kind: kept.kind,
+                        size: kept.text.len(),
+                        paths_count: kept.paths.len(),
+                    };
+                    log.append(now, event);
+                }
+            }
+            Err(e) => failed = Some(e.to_string()),
+        }
     }
-    board_now(rule)
+    match failed {
+        Some(e) if posted == 0 => Err(e),
+        _ => board_now(&rules),
+    }
 }
 
-/// The person's Clear: one entry (`entry`), or the whole board. Logged with the count.
+/// The person's Clear: one entry (`entry`: where it is kept, [`BoardEntryView::refs`]), or every board of `rules`. Logged
+/// with the count.
 #[tauri::command]
-async fn board_clear(desktop: State<'_, Desktop>, rule: u64, entry: Option<u64>) -> Result<BoardView, String> {
-    let what = match entry {
-        Some(id) => marv_kernel::Clear::Entry(id, None),
-        None => marv_kernel::Clear::All,
+async fn board_clear(desktop: State<'_, Desktop>, rules: Vec<u64>, entry: Option<Vec<(u64, u64)>>) -> Result<BoardView, String> {
+    let store = board_store()?;
+    let targets: Vec<(u64, marv_kernel::Clear)> = match entry {
+        // Only boards of these rules.
+        Some(refs) => {
+            refs.into_iter().filter(|(r, _)| rules.contains(r)).map(|(r, id)| (r, marv_kernel::Clear::Entry(id, None))).collect()
+        }
+        None => rules.iter().map(|r| (*r, marv_kernel::Clear::All)).collect(),
     };
-    let count = board_store()?.clear(marv_kernel::PolicyId(rule), what, now_ms()).await.map_err(|e| e.to_string())?;
-    if count > 0
-        && let Some(log) = desktop.event_log()
-    {
-        log.append(now_ms(), marv_kernel::KernelEvent::BoardCleared { rule: marv_kernel::PolicyId(rule), by: None, count });
+    for (rule, what) in targets {
+        let count = store.clear(marv_kernel::PolicyId(rule), what, now_ms()).await.map_err(|e| e.to_string())?;
+        if count > 0
+            && let Some(log) = desktop.event_log()
+        {
+            log.append(now_ms(), marv_kernel::KernelEvent::BoardCleared { rule: marv_kernel::PolicyId(rule), by: None, count });
+        }
     }
-    board_now(rule)
+    board_now(&rules)
 }
 
 /// A chat's grant, as the Background list and the chat's header show it.
@@ -5190,6 +5263,32 @@ fn logs_recent() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A team in worktrees has a board per rule: the Teams screen shows them as one, oldest first, and your post, kept
+    /// once in each, once.
+    #[test]
+    fn a_teams_boards_merge_into_one_and_your_post_shows_once() {
+        use marv_kernel::{BoardBy, BoardEntry, BoardKind};
+        let entry = |id, by: BoardBy, text: &str, at_ms| BoardEntry {
+            id,
+            by,
+            kind: BoardKind::Note,
+            text: text.into(),
+            paths: vec![],
+            at_ms,
+        };
+        let chat = |n: &str| BoardBy::Chat(n.into());
+        let merged = merge_boards(vec![
+            (7, vec![entry(1, chat("lead"), "plan", 30), entry(2, BoardBy::Person, "hello", 50)]),
+            (13, vec![entry(1, chat("worker"), "claiming a", 10), entry(2, BoardBy::Person, "hello", 50)]),
+            (14, vec![entry(1, chat("worker"), "same words", 30), entry(2, BoardBy::Person, "hello", 60)]),
+        ]);
+        let said: Vec<(&str, &str)> = merged.iter().map(|e| (e.by.as_str(), e.text.as_str())).collect();
+        assert_eq!(said, [("worker", "claiming a"), ("lead", "plan"), ("worker", "same words"), ("", "hello"), ("", "hello")]);
+        assert_eq!(merged[3].refs, [(7, 2), (13, 2)], "one post, kept on two boards");
+        assert_eq!(merged[4].refs, [(14, 2)], "a later post of the same words is another");
+        assert!(merge_boards(vec![(1, vec![])]).is_empty());
+    }
 
     /// Marv reads its provider once, at start: a Marv chat started on Ollama before OpenRouter was set up gets a card
     /// saying so, and one still on the config's provider gets none.

@@ -219,6 +219,12 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     for path in &opts.read_only_on_top {
         args.extend(["--ro-bind".into(), path.clone().into_os_string(), path.clone().into_os_string()]);
     }
+    // Then, each on top of the one before: a worktree's own git folder writable again inside the read-only `worktrees/`
+    // folder, and its pointers read-only inside that. In this order, never sorted.
+    for (path, writable) in &opts.on_top_then {
+        let flag = if *writable { "--bind" } else { "--ro-bind" };
+        args.extend([flag.into(), path.clone().into_os_string(), path.clone().into_os_string()]);
+    }
     // Writable folders inside a read-only project (a chat role's write set): the protected paths in them stay read-only.
     let inside_writable = |path: &Path| writable.iter().any(|w| path.starts_with(&w.real) || path.starts_with(&w.given));
     if !read_only || !writable.is_empty() {
@@ -924,6 +930,31 @@ mod tests {
         fs.kinds.insert("/home/me/.cargo/credentials".into(), FileKind::Symlink);
         fs.dangling = true;
         assert!(!joined(&base(), &fs).contains("/dev/null"));
+    }
+
+    /// A worktree's git guard: the repository's `.git` writable, read-only on top, then the worktree's folder writable
+    /// again and its pointers read-only, in exactly that order (a later mount covers the earlier ones), before the
+    /// placeholders.
+    #[test]
+    fn on_top_mounts_come_after_the_writable_ones_in_order() {
+        let opts = SandboxOptions {
+            writable: vec!["/srv/repo/.git".into()],
+            read_only_on_top: vec!["/srv/repo/.git/worktrees".into(), "/srv/repo/.git/config".into()],
+            on_top_then: vec![("/srv/repo/.git/worktrees/w1".into(), true), ("/srv/repo/.git/worktrees/w1/gitdir".into(), false)],
+            placeholders: vec!["/home/me/proj/info".into()],
+            ..base()
+        };
+        let args = joined(&opts, &Fake::new(|p| p.starts_with("/srv")));
+        let at = |needle: &str| args.find(needle).unwrap_or_else(|| panic!("{needle} in {args}"));
+        let order = [
+            at("--bind /srv/repo/.git /srv/repo/.git"),
+            at("--ro-bind /srv/repo/.git/worktrees /srv/repo/.git/worktrees"),
+            at("--ro-bind /srv/repo/.git/config /srv/repo/.git/config"),
+            at("--bind /srv/repo/.git/worktrees/w1 /srv/repo/.git/worktrees/w1"),
+            at("--ro-bind /srv/repo/.git/worktrees/w1/gitdir /srv/repo/.git/worktrees/w1/gitdir"),
+            at("--tmpfs /home/me/proj/info"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}: {args}");
     }
 
     #[test]

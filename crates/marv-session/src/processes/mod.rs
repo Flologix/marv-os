@@ -570,6 +570,7 @@ impl ProcessManager {
             read_only,
             writable,
             read_only_on_top: vec![],
+            on_top_then: vec![],
             placeholders: guard.placeholders,
             project_read_only,
             binds,

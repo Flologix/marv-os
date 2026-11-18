@@ -10,6 +10,7 @@
 //! | writable extras, binds, the scratch folder, the command's temporary folder | read-write |
 //! | protected paths | no writing (lasting) |
 //! | `read_only_on_top` (git's write guard) | no writing, this run only (an approved commit writes there) |
+//! | `on_top_then` (a worktree's git guard, Linux only) | its read-only paths denied; a writable one gets no rule |
 //! | Marv's runtime and config folders, the home's private entries, credentials | nothing (lasting) |
 //! | in a home-folder project: every hidden entry at the top of the home, and `AppData` | nothing (lasting) |
 //!
@@ -82,6 +83,13 @@ pub fn grants(plan: &Plan, tmp: &Path, fs: &dyn FsProbe) -> Result<Vec<Grant>, S
     }
     for path in &plan.read_only_on_top {
         out.push(rule(path.clone(), Access::DenyWrite, false));
+    }
+    // A worktree's git guard (`on_top_then`, Linux only) can't be said here: a deny wins over a later allow. Its
+    // read-only paths are denied, and a writable one gets no rule, so it stays as read-only as its parent: never wider.
+    for (path, writable) in &plan.on_top_then {
+        if !writable {
+            out.push(rule(path.clone(), Access::DenyWrite, false));
+        }
     }
     // A home-folder project: as bubblewrap hides every hidden entry at the top of the home, and on Windows `AppData`
     // too (browser profiles, logins, other programs' settings).

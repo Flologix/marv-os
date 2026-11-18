@@ -56,6 +56,10 @@ pub struct Plan {
     /// Paths inside a writable folder that stay read-only on top of it, mounted after the writable extras: the parts
     /// of a `.git` that a command changing the repository without asking may not touch (`git_guard::git_write_guard`).
     pub read_only_on_top: Vec<PathBuf>,
+    /// Mounted after [`Plan::read_only_on_top`], in this order, each on top of what came before (`true`: writable,
+    /// `false`: read-only): a worktree's own git folder writable again inside the read-only `worktrees/` folder of the
+    /// repository's `.git`, with its pointers read-only inside that (`git_guard::git_write_guard`). Bubblewrap only.
+    pub on_top_then: Vec<(PathBuf, bool)>,
     /// Paths inside the project that don't exist yet and must stay that way: each gets an empty read-only folder
     /// (a project without `.git`, so a command can't create a repository whose config git would run outside). bwrap
     /// leaves the empty mount point behind; [`SandboxBackend::after`] removes it.

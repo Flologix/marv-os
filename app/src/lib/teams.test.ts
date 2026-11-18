@@ -124,6 +124,22 @@ test("only a localhost port's own page opens from a process", () => {
   assert.ok(!isProcessUrl("javascript:alert(1)"));
 });
 
+test("the roster: a member its own Marv says waits or works shows so, as Activity does, beside a live state of idle", () => {
+  const chats = [
+    { id: "aaaaaaaa1", title: "lead", folder: "/p", role: "coordinator" },
+    { id: "bbbbbbbb2", title: "worker", folder: "/p", role: "builder" },
+    { id: "cccccccc3", title: "worker-2", folder: "/p", role: "builder" },
+  ];
+  const idle = (id: string) => ({ id, busy: false, waiting: 0, asleep: false, cantWake: null, paused: false });
+  const agents = [
+    { name: "p-aaaaaaaa", live: {}, state: "busy" as const },
+    { chat: "bbbbbbbb2", name: "p-bbbbbbbb", live: {}, state: "waiting" as const },
+    { chat: "cccccccc3", name: "p-cccccccc", live: {}, state: "idle" as const },
+  ];
+  const cards = roster(chats.map((c) => c.id), chats, chats.map((c) => idle(c.id)), agents, [], []);
+  assert.deepEqual(cards.map((c) => [c.tone, c.word, c.waiting]), [["working", "working", 0], ["waiting", "needs you", 1], ["idle", "idle", 0]]);
+});
+
 test("the roster: each member's state, model, overlaps, processes and last report, in start order", () => {
   const chats = [
     { id: "b", title: "demo-frontend", folder: "/p", role: "frontend", settings: { model: "z/glm" }, writes: ["index.html"] },

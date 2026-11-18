@@ -24,7 +24,10 @@
 //!   caller made read-only.
 //! - marv-rs: a confined `git_write` command (bubblewrap, a plain `.git`, not a setup change: `git_write_unasked`)
 //!   gets `.git` writable with what git runs programs from read-only on top (`git_guard::git_write_guard`), so
-//!   commits, branches and merges don't ask. One that fails on those parts gets `GIT_SETUP_HINT`.
+//!   commits, branches and merges don't ask. One that fails on those parts gets `GIT_SETUP_HINT`. A git worktree whose
+//!   records check out (a Marv OS team member's) gets the same, built from the repository's common `.git` and the
+//!   worktree's own folder in it, with the pointers read-only (`worktree_git_write_allowed`); a chat with a role's write
+//!   set, a turn that sees the project read-only, or a caller that made the shared `.git` read-only still asks.
 //! - Notes after the output: the stand-in home (`touches_hidden_home`), the missing network (not for 126/127; a
 //!   timeout counts) and, for `gh`, the GitHub MCP server instead (#23, #27).
 //! - Scope `bash:[net:][git:]<command>` ("this exact command"); `auto_safe` only sandboxed, without network or
@@ -51,7 +54,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use marv_sandbox::git_guard::{
-    GitGuard, GitWrite, GitWriteBlocked, git_guard, git_write_guard, git_write_supported, worktree_git,
+    GitGuard, GitWrite, GitWriteBlocked, git_guard, git_write_guard, git_write_is_worktree, git_write_supported, worktree_git,
 };
 use marv_sandbox::notes::{
     BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, GIT_SETUP_HINT, HIDDEN_NEXT_STEP,
@@ -116,6 +119,8 @@ pub struct RunOptions {
     pub writable: Vec<PathBuf>,
     /// Read-only inside a writable folder, mounted on top of it (`marv_sandbox::Plan::read_only_on_top`).
     pub read_only_on_top: Vec<PathBuf>,
+    /// Mounted after `read_only_on_top`, in order (`true`: writable): `marv_sandbox::Plan::on_top_then`.
+    pub on_top_then: Vec<(PathBuf, bool)>,
     pub placeholders: Vec<PathBuf>,
     pub project_read_only: bool,
     /// Not sandboxed: this environment instead of the minimal one (the host door's, `host_env`).
@@ -206,6 +211,7 @@ pub async fn run_command(
         read_only,
         writable,
         read_only_on_top,
+        on_top_then,
         placeholders,
         project_read_only,
         env,
@@ -227,6 +233,7 @@ pub async fn run_command(
             read_only,
             writable,
             read_only_on_top,
+            on_top_then,
             placeholders,
             project_read_only,
             binds: vec![],
@@ -682,7 +689,29 @@ fn git_write_unasked(input: &BashInput, ctx: &ToolContext) -> bool {
     cfg!(target_os = "linux")
         && !marv_sandbox::home_project(&ctx.root, &ctx.sandbox.home)
         && !changes_git_setup(&input.command)
+        && worktree_git_write_allowed(ctx)
         && git_write_supported(&ctx.root)
+}
+
+/// Whether the chat has a role's write set, or is a task turn without edit tools (an empty one): it sees the project
+/// read-only apart from the set, and its bash doesn't commit (see [`Bash::run`]).
+fn has_role_set(ctx: &ToolContext) -> bool {
+    ctx.write_set.is_some() || (ctx.task_read_only && ctx.mode == crate::CallMode::Task)
+}
+
+/// A worktree's git_write guard (`git_write_guard`: the repository's `.git` writable, with what git runs programs from
+/// read-only on top) is for a chat that may write its whole project: not a role with a write set (what it may change
+/// is the set), not a turn that sees the project read-only (a wake's), and not one whose caller made the repository's
+/// `.git` or the worktree's record read-only (a worktree subagent's shared `.git`). Those ask or stay read-only, as
+/// before. A project that isn't a worktree is not affected.
+fn worktree_git_write_allowed(ctx: &ToolContext) -> bool {
+    if !git_write_is_worktree(&ctx.root) {
+        return true;
+    }
+    let kept: Vec<PathBuf> = ctx.read_only.iter().map(|d| real_or_self(d)).collect();
+    !has_role_set(ctx)
+        && !ctx.project_read_only
+        && !worktree_git(&ctx.root).iter().any(|dir| kept.iter().any(|ro| is_inside(ro, &real_or_self(dir))))
 }
 
 /// `git config` that only reads (a key alone, `--get…`, `--list`), and per-command `git -c key=value` overrides: they
@@ -1047,7 +1076,12 @@ impl Tool for Bash {
         // A git_write command that runs without asking ([`git_write_unasked`]) gets .git writable instead, with what
         // git runs programs from still read-only (`git_write_guard`), held until the command has ended.
         let home_project = ctx.sandbox.active() && marv_sandbox::home_project(&ctx.root, &ctx.sandbox.home);
-        let git_write = if ctx.confined && input.git_write.unwrap_or(false) && ctx.sandbox.active() && !home_project {
+        let git_write = if ctx.confined
+            && input.git_write.unwrap_or(false)
+            && ctx.sandbox.active()
+            && !home_project
+            && worktree_git_write_allowed(ctx)
+        {
             wait_for_git_write(&ctx.root, &ctx.cancel).await
         } else {
             None
@@ -1077,11 +1111,13 @@ impl Tool for Bash {
         // writable on top (a missing one can't be made from bash: write_file makes folders). An approved git_write
         // can't write .git then either, nor an unasked one (its guard's `.git`): a role with a write set doesn't commit
         // from bash.
-        let mut writable: Vec<PathBuf> = approved_git.into_iter().chain(git_write.as_ref().map(|g| g.writable.clone())).collect();
+        let mut writable: Vec<PathBuf> =
+            approved_git.iter().cloned().chain(git_write.as_ref().map(|g| g.writable.clone())).collect();
         // A role with no edit tool and no `writes:` is `writes: []` in a task turn (`ToolContext::task_read_only`).
         let task_empty = crate::WriteSet::default();
         let role_set =
             ctx.write_set.as_deref().or((ctx.task_read_only && ctx.mode == crate::CallMode::Task).then_some(&task_empty));
+        debug_assert_eq!(role_set.is_some(), has_role_set(ctx));
         // A command that runs unasked in a wake's turn (`ctx.project_read_only`, `CallMode::sandboxed_unasked_project_read_only`)
         // sees the whole project read-only, a role's set included: what has to change the project asks first, and then
         // runs with the set. A task turn never has `ctx.project_read_only`: it runs inside its set (or the project).
@@ -1089,6 +1125,9 @@ impl Tool for Bash {
             Some(set) => {
                 if !ctx.project_read_only {
                     writable = set.existing(&ctx.root, !home_project);
+                    // The worktree's git folders stay in view, read-only: without them git can't open the repository
+                    // at all ("gitfile does not point to a valid repository"), though they can't be changed here.
+                    read_only.extend(approved_git);
                 }
                 true
             }
@@ -1105,6 +1144,7 @@ impl Tool for Bash {
             read_only,
             writable,
             read_only_on_top: git_write.as_ref().map(|g| g.read_only_on_top.clone()).unwrap_or_default(),
+            on_top_then: git_write.as_ref().map(|g| g.on_top_then.clone()).unwrap_or_default(),
             placeholders: guard
                 .placeholders
                 .iter()
@@ -1977,6 +2017,159 @@ mod tests {
         assert_eq!(crate::test_support::git_output(root.path(), &["status", "--porcelain"]), "");
     }
 
+    /// A role whose write set is empty (the coordinator on a task) and a git_write the person approved, in a worktree
+    /// under the hidden home: git still opens the repository (the worktree's git folders are shown read-only, as to a
+    /// command that runs unasked), and the commit that has to write the repository fails on the read-only mount, not
+    /// on a "gitfile does not point to a valid repository".
+    #[tokio::test]
+    async fn an_approved_git_write_under_a_write_set_still_sees_the_worktrees_repository() {
+        require_bwrap!();
+        let top = TempDir::new("bash-wt-write-set");
+        let home = top.path().join("home");
+        let main = home.join("Projects/main");
+        std::fs::create_dir_all(&main).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["-c", "user.email=a@b", "-c", "user.name=n", "commit", "-qm", "1", "--allow-empty"],
+        ] {
+            crate::test_support::git(&main, args);
+        }
+        let wt = home.join(".marv/worktrees/main/wt");
+        crate::test_support::git(&main, &["worktree", "add", "-q", "-b", "marv/wt", wt.to_str().unwrap()]);
+        let mut ctx = ToolContext::new(&wt);
+        ctx.sandbox = std::sync::Arc::new(Sandbox { config_dir: Some(home.join(".marv")), home, ..Sandbox::from_env(true) });
+        ctx.write_set = Some(std::sync::Arc::new(crate::WriteSet::default()));
+        let out =
+            Bash.run(&git_bash("git log --oneline -1 && git branch --show-current; git branch x", true), &ctx).await.unwrap();
+        assert!(out.output.contains("marv/wt"), "{}", out.output);
+        assert!(!out.output.contains("gitfile"), "{}", out.output);
+        assert!(
+            out.output.contains("Read-only file system"),
+            "the repository can't be changed under an empty write set: {}",
+            out.output
+        );
+        assert_eq!(crate::test_support::git_output(&main, &["branch", "--list", "x"]), "", "and wasn't");
+    }
+
+    /// A repository under a hidden home with two worktrees (`wt`, `wt2`) and a branch `side` one commit ahead of main
+    /// on a file of its own; the context of a worker in `wt` (no write set), and the repository's common `.git`.
+    fn worktree_repo(name: &str) -> (TempDir, ToolContext, PathBuf, PathBuf) {
+        let top = TempDir::new(name);
+        let home = top.path().join("home");
+        let main = home.join("Projects/main");
+        std::fs::create_dir_all(&main).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["-c", "user.email=a@b", "-c", "user.name=n", "commit", "-qm", "1", "--allow-empty"],
+            &["checkout", "-q", "-b", "side"],
+        ] {
+            crate::test_support::git(&main, args);
+        }
+        std::fs::write(main.join("side.txt"), "s\n").unwrap();
+        for args in [
+            &["add", "side.txt"][..],
+            &["-c", "user.email=a@b", "-c", "user.name=n", "commit", "-qm", "side"],
+            &["checkout", "-q", "main"],
+        ] {
+            crate::test_support::git(&main, args);
+        }
+        let wt = home.join(".marv/worktrees/main/wt");
+        let wt2 = home.join(".marv/worktrees/main/wt2");
+        crate::test_support::git(&main, &["worktree", "add", "-q", "-b", "marv/wt", wt.to_str().unwrap()]);
+        crate::test_support::git(&main, &["worktree", "add", "-q", "-b", "marv/wt2", wt2.to_str().unwrap()]);
+        let mut ctx = ToolContext::new(&wt);
+        ctx.confined = true;
+        ctx.sandbox = std::sync::Arc::new(Sandbox { config_dir: Some(home.join(".marv")), home, ..Sandbox::from_env(true) });
+        let common = std::fs::canonicalize(main.join(".git")).unwrap();
+        (top, ctx, main, common)
+    }
+
+    /// A worker in a git worktree (what a Marv OS team member works in) commits, merges and branches without asking:
+    /// the repository's objects, refs and its own HEAD and index are writable, and everything git follows to run a
+    /// program, or to find the repository, is not.
+    #[tokio::test]
+    async fn a_git_write_in_a_worktree_runs_unasked_but_cant_touch_what_git_runs_or_the_pointers() {
+        require_bwrap!();
+        let (_top, ctx, main, common) = worktree_repo("bash-wt-git-write");
+        let wt = ctx.root.clone();
+        let admin = common.join("worktrees/wt");
+        let ident = "git -c user.email=a@b -c user.name=n";
+        let commit = format!(
+            "echo a > f && git add f && {ident} commit -qm two && git branch x && {ident} merge -q --no-ff -m merged side \
+             && git tag t1 && git log --oneline | wc -l"
+        );
+        let out = Bash.run(&git_bash(&commit, true), &ctx).await.unwrap();
+        assert!(out.output.starts_with("4\n"), "{}", out.output);
+        // It was the repository's, not a copy: the main checkout sees the branch and the worktree's branch moved.
+        assert_eq!(crate::test_support::git_output(&main, &["branch", "--list", "x"]).trim(), "x");
+        assert_eq!(crate::test_support::git_output(&main, &["rev-list", "--count", "marv/wt"]).trim(), "4");
+        assert_eq!(crate::test_support::git_output(&wt, &["status", "--porcelain"]), "");
+        let config = std::fs::read_to_string(common.join("config")).unwrap();
+        let git_file = std::fs::read_to_string(wt.join(".git")).unwrap();
+        let pointers = ["commondir", "gitdir"].map(|n| std::fs::read_to_string(admin.join(n)).unwrap());
+        let other = common.join("worktrees/wt2");
+        let other_head = std::fs::read_to_string(other.join("HEAD")).unwrap();
+        let (common, admin, other, wt_s) = (common.display(), admin.display(), other.display(), wt.display());
+        for planted in [
+            format!("echo '[core]' >> {common}/config"),
+            format!("echo evil > {common}/hooks/pre-commit"),
+            format!("echo '* filter=x' > {common}/info/attributes"),
+            format!("mkdir -p {common}/modules/x"),
+            format!("echo /tmp/evil > {common}/commondir"),
+            format!("echo '[core]' > {common}/config.worktree"),
+            format!("echo x > {other}/HEAD"),
+            format!("echo x > {other}/gitdir"),
+            format!("echo x > {other}/config.worktree"),
+            format!("echo x > {admin}/commondir"),
+            format!("echo x > {admin}/gitdir"),
+            format!("echo '[core]' > {admin}/config.worktree"),
+            format!("echo 'gitdir: /tmp/x' > {wt_s}/.git"),
+            format!("rm {wt_s}/.git"),
+            format!("mv {admin} {admin}.old"),
+            format!("rm -rf {common}/worktrees"),
+            format!("mv {common} {common}-old"),
+            "git config core.hooksPath /tmp".into(),
+        ] {
+            let out = Bash.run(&git_bash(&planted, true), &ctx).await.unwrap();
+            assert!(!out.output.ends_with("[exit code 0]"), "{planted}: {}", out.output);
+        }
+        let (common, admin) = (std::path::PathBuf::from(common.to_string()), std::path::PathBuf::from(admin.to_string()));
+        assert_eq!(std::fs::read_to_string(common.join("config")).unwrap(), config);
+        assert_eq!(std::fs::read_to_string(wt.join(".git")).unwrap(), git_file);
+        assert_eq!(["commondir", "gitdir"].map(|n| std::fs::read_to_string(admin.join(n)).unwrap()), pointers);
+        assert_eq!(std::fs::read_to_string(common.join("worktrees/wt2/HEAD")).unwrap(), other_head);
+        assert!(!common.join("hooks/pre-commit").exists() && !common.join("info/attributes").exists());
+        // The stand-ins and placeholders are gone again.
+        assert!(!common.join("modules").exists() && !common.join("commondir").exists());
+        assert!(!common.join("config.worktree").exists() && !admin.join("config.worktree").exists());
+        assert_eq!(crate::test_support::git_output(&main, &["worktree", "list"]).lines().count(), 3);
+    }
+
+    /// The same worktree under a role's write set, a turn that sees the project read-only, or a caller that made its
+    /// `.git` read-only: still asked, and it doesn't write the repository.
+    #[tokio::test]
+    async fn a_worktrees_git_write_under_a_write_set_or_a_read_only_git_is_still_asked() {
+        require_bwrap!();
+        let (_top, ctx, main, common) = worktree_repo("bash-wt-git-write-asked");
+        let ctx = ToolContext { sandbox: std::sync::Arc::new(Sandbox { assume_backend: true, ..(*ctx.sandbox).clone() }), ..ctx };
+        let commit = git_bash("git branch y", true);
+        assert!(Bash.auto_safe(&commit, &ctx), "a worker with the whole project: unasked");
+        let set = ToolContext { write_set: Some(std::sync::Arc::new(crate::WriteSet::default())), ..ctx.clone() };
+        assert!(!Bash.auto_safe(&commit, &set));
+        let task = ToolContext { task_read_only: true, mode: crate::CallMode::Task, ..ctx.clone() };
+        assert!(!Bash.auto_safe(&commit, &task));
+        let woken = ToolContext { project_read_only: true, ..ctx.clone() };
+        assert!(!Bash.auto_safe(&commit, &woken));
+        let shared = ToolContext { read_only: vec![common.clone()], ..ctx.clone() };
+        assert!(!Bash.auto_safe(&commit, &shared));
+        // Run anyway (as confined, as the guards' tests do): none of them gets the repository writable.
+        for ctx in [set, task, shared] {
+            let out = Bash.run(&git_bash("git branch y", true), &ctx).await.unwrap();
+            assert!(!out.output.ends_with("[exit code 0]"), "{}", out.output);
+        }
+        assert_eq!(crate::test_support::git_output(&main, &["branch", "--list", "y"]), "");
+    }
+
     #[tokio::test]
     async fn a_git_write_that_needs_the_config_says_how_to_get_it() {
         require_bwrap!();
@@ -2012,7 +2205,8 @@ mod tests {
         ] {
             assert!(!unasked(command), "{command}");
         }
-        // Not where .git is a worktree's file or missing: asked, as before.
+        // Not where .git is a worktree's file that doesn't check out, or missing: asked, as before. (A real worktree
+        // runs unasked: `a_git_write_in_a_worktree_runs_unasked_but_cant_touch_what_git_runs_or_the_pointers`.)
         let tree = TempDir::new("bash-git-write-worktree");
         tree.write(".git", "gitdir: /elsewhere\n");
         assert!(!Bash.auto_safe(&git_bash("git commit -am x", true), &ToolContext { root: tree.path().into(), ..ctx.clone() }));
