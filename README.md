@@ -83,5 +83,6 @@ subscription you already pay for, or a local model.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): build, test and send a change
 - [SECURITY.md](SECURITY.md): report a vulnerability privately
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): how we work together, and where to report a problem
 - [LICENSE](LICENSE): Apache License 2.0, with third-party notices in [NOTICE](NOTICE)
 - [TRADEMARKS.md](TRADEMARKS.md): "Marv", "Marv OS", the Martian and FlologixAI are trademarks, so a fork needs its own name and logo
