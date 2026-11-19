@@ -17,7 +17,7 @@ More at [flologixai.com/marv-os](https://www.flologixai.com/marv-os).
 | --- | --- |
 | Linux x86_64 | AppImage or `.deb` (a CLI-only `.tar.gz` is also published) |
 | macOS, Apple silicon | `.dmg` |
-| Windows x64 | installer (`-setup.exe`), from 1.0.0-rc.2 on |
+| Windows x64 | installer (`-setup.exe`) |
 
 Check the files against `SHA256SUMS` from the same release.
 
