@@ -278,3 +278,9 @@ export function replyGuard(): { begin: () => () => boolean; end: () => void } {
     },
   };
 }
+
+/** Whether a chat's agent just finished a turn (busy, then not): what it wrote is on disk now, so the files shown are
+ * read again then instead of at the next look. */
+export function turnEnded(busyBefore: boolean | undefined, busyNow: boolean | undefined): boolean {
+  return busyBefore === true && busyNow === false;
+}

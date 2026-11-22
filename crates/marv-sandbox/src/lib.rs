@@ -203,7 +203,7 @@ impl Sandbox {
             enabled,
             home: home.clone(),
             account_home,
-            path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            path: marv_core::process::host_var("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
             lang: std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
             mesh_socket: None,
             hidden: runtime_paths(&runtime_env()),

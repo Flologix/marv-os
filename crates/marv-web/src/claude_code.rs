@@ -686,7 +686,7 @@ pub fn person_servers(spec: &ChatSpec) -> serde_json::Map<String, Value> {
     if !spec.sources.contains(&marv_session::sources::Source::User) {
         return servers;
     }
-    let env: marv_mcp::Env = std::env::vars().collect();
+    let env: marv_mcp::Env = marv_core::process::vars().into_iter().collect();
     let include = Include { personal: true, project: false };
     for server in load_mcp_config(&spec.root, &spec.config_dir, &env, include).servers {
         let off = spec.mcp_off.contains(&server.name) || spec.devices_off.contains(&format!("mcp:{}", server.name));

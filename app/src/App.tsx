@@ -72,6 +72,11 @@ function useSettings() {
     );
   }, []);
   useEffect(() => keep(SETTINGS_KEY, settings), [settings]);
+  // The desktop keeps the pick too: a chat's terminal that starts with no settings of its own (the first chat) seeds
+  // Marv's config with it, else its Marv started on the CLI's default model.
+  useEffect(() => {
+    if (isDesktop) void desktop.setDefaultModel(settings.model).catch(() => {});
+  }, [settings.model]);
   useEffect(() => {
     void reloadModels();
   }, []);
@@ -802,7 +807,7 @@ function Desktop() {
             )
           }
         />
-        {dock.open && <Dock key={`dock:${dockKey}`} chatId={chatId} folder={folder} chat={chat} team={!!chats.find((c) => c.id === chatId)?.team} tab={dock.tab} onTab={(tab) => setDock({ ...dock, tab })} />}
+        {dock.open && <Dock key={`dock:${dockKey}`} chatId={chatId} folder={folder} chat={chat} team={!!chats.find((c) => c.id === chatId)?.team} tab={dock.tab} onTab={(tab) => setDock({ ...dock, tab })} busy={live.find((l) => l.id === chatId)?.busy} />}
       </div>
     </div>
   );

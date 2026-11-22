@@ -389,7 +389,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
         return Err(SessionError::Invalid("resume needs persist (there's nowhere to resume from)".into()));
     }
     // The real environment only: never a project file (docs/SECURITY.md).
-    let env: Env = std::env::vars().collect();
+    let env: Env = marv_core::process::vars().into_iter().collect();
     let config_dir = options.config_dir.clone().unwrap_or_else(|| default_config_dir(&env, &home));
     // A project's instructions are the person's only once trusted (docs/SECURITY.md): a cloned repository's aren't.
     let loaded = load_sources(&root, &options.sources, &config_dir, &home, &env, options.trust_project).await;

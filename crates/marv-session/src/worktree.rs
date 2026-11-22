@@ -167,7 +167,14 @@ pub async fn inspect_repo(root: &Path) -> Option<RepoState> {
 
 /// Creates the worktree and its branch from HEAD (`ToolError(NOT_A_REPO)` outside a repository with a commit).
 pub async fn create_worktree(root: &Path, base_dir: &Path, description: &str) -> Result<Worktree, ToolError> {
-    let repo = inspect_repo(root).await.ok_or_else(|| ToolError::new(NOT_A_REPO))?;
+    let repo = match inspect_repo(root).await {
+        Some(repo) => repo,
+        // Without git at all, "needs a git repository" sent the person looking for a problem with their folder.
+        None => {
+            let (_, out) = git(root, &["--version"], &[]).await;
+            return Err(ToolError::new(if out == marv_core::process::GIT_MISSING { out } else { NOT_A_REPO.to_string() }));
+        }
+    };
     let id: String = marv_fs::random_hex().chars().take(4).collect();
     let branch = branch_name(description, &id);
     let dir = base_dir.join(&branch["marv/".len()..]);
@@ -357,6 +364,18 @@ pub(crate) mod tests {
         write(repo.0.join("b.txt"), "new\n");
         assert_eq!(inspect_repo(&repo.0).await.unwrap().dirty, 1);
         assert_eq!(inspect_repo(&trees.0).await, None, "None outside a git repo");
+    }
+
+    /// Without git (Windows without Git for Windows) a worktree's refusal names Git, not "needs a git repository".
+    #[tokio::test]
+    async fn without_git_a_worktree_names_git() {
+        let (repo, trees) = setup();
+        crate::git::GIT_PROGRAM.set("marv-test-no-such-git");
+        let made = create_worktree(&repo.0, &trees.0, "task").await.map(|_| ());
+        crate::git::GIT_PROGRAM.set("git");
+        assert_eq!(made, Err(ToolError::new(marv_core::process::GIT_MISSING)));
+        let outside = create_worktree(&trees.0, &trees.0, "task").await.map(|_| ());
+        assert_eq!(outside, Err(ToolError::new(NOT_A_REPO)), "with git, a plain folder is still not a repository");
     }
 
     #[test]

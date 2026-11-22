@@ -73,6 +73,25 @@ const SETTINGS: [&str; 8] =
 /// `.gitattributes` with `text` rules still converts, as it always did.
 const NO_ATTRIBUTES: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+// Said when `git` itself can't be started: the same words as the CLI's checkpoints and worktrees (marv-core).
+pub use marv_core::process::{GIT_MISSING, git_start_error};
+
+/// The program run as git: "git", or in a test one that isn't there.
+#[cfg(not(test))]
+fn git_program() -> &'static str {
+    "git"
+}
+
+#[cfg(test)]
+thread_local! {
+    static GIT_PROGRAM: std::cell::Cell<&'static str> = const { std::cell::Cell::new("git") };
+}
+
+#[cfg(test)]
+fn git_program() -> &'static str {
+    GIT_PROGRAM.get()
+}
+
 fn run(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<std::process::Output, String> {
     run_pathspecs(dir, args, index, true)
 }
@@ -80,7 +99,7 @@ fn run(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<std::process::
 /// [`run`], with `literal` off for the one call that writes its pathspecs as `:(literal)…` / `:(exclude,literal)…`
 /// itself (an exclude is magic, which `GIT_LITERAL_PATHSPECS` would turn into a file name).
 fn run_pathspecs(dir: &Path, args: &[&str], index: Option<&Path>, literal: bool) -> Result<std::process::Output, String> {
-    let mut cmd = marv_core::process::command("git");
+    let mut cmd = marv_core::process::command(git_program());
     cmd.current_dir(dir).args(SETTINGS).args(args).env("GIT_ATTR_SOURCE", NO_ATTRIBUTES);
     // A fixed name for the checkpoints' commits (the person's git may have none set), and no hooks or pager. Paths
     // are literal: a file named `[draft]*.md` is that file, not a pattern (restore passes the diff's paths back).
@@ -100,7 +119,7 @@ fn run_pathspecs(dir: &Path, args: &[&str], index: Option<&Path>, literal: bool)
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
     }
-    cmd.output().map_err(|e| format!("git: {e}"))
+    cmd.output().map_err(|e| git_start_error(&e, dir))
 }
 
 /// What went wrong, from git's stderr: its `error:` and `fatal:` lines when it has any, else all of it.
@@ -119,13 +138,17 @@ fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String
 }
 
 /// The top of the git repository `dir` is in, and `dir` inside it as git writes it (`""` at the top, else
-/// `sub/dir/`); `None` outside one. Asked of git rather than worked out from the paths: on Windows `dir` may be
-/// `\\?\C:\…` with backslashes while git answers `C:/…`.
-fn repo_place(dir: &Path) -> Option<(PathBuf, String)> {
-    let out = git(dir, &["rev-parse", "--show-toplevel", "--show-prefix"], None).ok()?;
+/// `sub/dir/`); `None` outside one, and an error only when git itself can't start ([`git_start_error`]). Asked of
+/// git rather than worked out from the paths: on Windows `dir` may be `\\?\C:\…` with backslashes while git answers
+/// `C:/…`.
+fn repo_place(dir: &Path) -> Result<Option<(PathBuf, String)>, String> {
+    let out = run(dir, &["rev-parse", "--show-toplevel", "--show-prefix"], None)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let out = String::from_utf8_lossy(&out.stdout);
     let mut lines = out.lines();
-    let top = PathBuf::from(lines.next()?);
-    Some((top, lines.next().unwrap_or("").to_string()))
+    Ok(lines.next().map(|top| (PathBuf::from(top), lines.next().unwrap_or("").to_string())))
 }
 
 /// The files `git add` skipped already told of, per chat, so a file that can't be read isn't logged on every turn.
@@ -479,10 +502,16 @@ impl Recorder {
     }
 }
 
-/// Chat `chat`'s turns where it works (`dir`), for the page.
+/// Chat `chat`'s turns where it works (`dir`); `None` outside a git repository, or without git.
 pub fn book_for(chat: &str, dir: &Path, data: &Path) -> Option<Book> {
-    let (top, prefix) = repo_place(dir)?;
-    Some(Book { chat: chat.to_string(), top, prefix, dir: data.join("checkpoints") })
+    find_book(chat, dir, data).ok().flatten()
+}
+
+/// [`book_for`] for the page, which says why there are none: an error when git isn't installed, so it isn't taken for
+/// a folder outside a repository.
+pub fn find_book(chat: &str, dir: &Path, data: &Path) -> Result<Option<Book>, String> {
+    let place = repo_place(dir)?;
+    Ok(place.map(|(top, prefix)| Book { chat: chat.to_string(), top, prefix, dir: data.join("checkpoints") }))
 }
 
 /// Chat `chat` is deleted: its refs under `refs/marv/checkpoints/<chat>/` (which keep every checkpoint's files in the
@@ -496,7 +525,7 @@ pub fn forget(chat: &str, dir: &Path, data: &Path) {
         let _ = std::fs::remove_file(checkpoints.join(name));
     }
     let existing = dir.ancestors().find(|d| d.is_dir());
-    let Some((top, _)) = existing.and_then(repo_place) else { return };
+    let Some((top, _)) = existing.and_then(|d| repo_place(d).ok().flatten()) else { return };
     let prefix = format!("refs/marv/checkpoints/{chat}/");
     let Ok(listed) = git(&top, &["for-each-ref", "--format=%(refname)", &prefix], None) else { return };
     let commands: String = listed.lines().filter(|r| r.starts_with(&prefix)).map(|r| format!("delete {r}\n")).collect();
@@ -732,7 +761,24 @@ mod tests {
     fn outside_a_repository_there_are_no_checkpoints() {
         let plain = tempfile::tempdir().unwrap();
         assert!(book_for("c", plain.path(), plain.path()).is_none());
+        assert_eq!(find_book("c", plain.path(), plain.path()).map(|b| b.is_none()), Ok(true));
         assert!(Recorder::new("c", plain.path(), plain.path(), || 0).is_none());
+    }
+
+    /// Without git (Windows without Git for Windows) the page names Git, not "program not found", and a repository
+    /// isn't taken for a plain folder.
+    #[test]
+    fn without_git_the_error_names_git() {
+        let project = repo();
+        GIT_PROGRAM.set("marv-test-no-such-git");
+        let found = find_book("c", project.path(), project.path()).map(|b| b.is_some());
+        let ran = run(project.path(), &["status"], None).map(|_| ());
+        GIT_PROGRAM.set("git");
+        assert_eq!(found, Err(GIT_MISSING.to_string()));
+        assert_eq!(ran, Err(GIT_MISSING.to_string()));
+        assert!(GIT_MISSING.starts_with("Git isn't installed"));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(git_start_error(&denied, project.path()).starts_with("git: "), "any other failure is said as it is");
     }
 
     /// Only the last [`KEEP`] turns are kept; an older one's refs go with it.

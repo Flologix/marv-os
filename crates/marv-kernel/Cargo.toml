@@ -17,6 +17,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# Activity's CPU and memory on Windows (`procstats`): Windows has no `ps`, and its own process APIs are `unsafe` FFI.
+[target.'cfg(windows)'.dependencies]
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
 [dev-dependencies]
 futures.workspace = true
 tempfile.workspace = true

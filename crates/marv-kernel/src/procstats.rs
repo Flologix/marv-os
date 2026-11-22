@@ -3,10 +3,13 @@
 //!
 //! **One portable layer.** Feature code never reads `/proc` itself: it asks [`stats`]. On Linux that reads
 //! `/proc/<pid>/stat` and `/proc/<pid>/status`; on macOS (and the BSDs) it runs `ps -o rss=,time=,etime= -p <pid>`,
-//! the same columns on both; anywhere else every answer is [`Stats::unknown`]. Chosen over the `sysinfo` and
-//! `libproc` crates: no new dependency, no build-time bindgen (libproc's), no `unsafe` anywhere (CLAUDE.md), and the
-//! `ps` path is the same program on Linux, so its parser is tested here too. A refresh is a few PIDs every couple of
-//! seconds, so one `ps` per PID is cheap enough. The future `marv kernel serve` (#39) shares it.
+//! the same columns on both; on Windows it asks the `sysinfo` crate; anywhere else every answer is
+//! [`Stats::unknown`]. On Unix chosen over the `sysinfo` and `libproc` crates: no new dependency, no build-time bindgen
+//! (libproc's), no `unsafe` anywhere (CLAUDE.md), and the `ps` path is the same program on Linux, so its parser is
+//! tested here too. A refresh is a few PIDs every couple of seconds, so one `ps` per PID is cheap enough. Windows has
+//! no `ps`, and its own way (`GetProcessTimes`, `GetProcessMemoryInfo`, a ToolHelp snapshot for the parents) is all
+//! `unsafe` FFI, so there `sysinfo` does it (a Windows-only dependency): Activity showed "—" for every agent before.
+//! The future `marv kernel serve` (#39) shares it.
 //!
 //! **Only Marv's own PIDs** (§20.9, guard `proc_reads_only_marvs_own_pids`). A PID is read only after the code that
 //! spawned it said so ([`own`]): the MCP client when it starts a local server, the process manager when it starts a
@@ -125,7 +128,7 @@ pub fn stats(pid: u32) -> Result<Stats, Refused> {
     Ok(stats)
 }
 
-/// [`stats`] for `pid` with its descendants' CPU and memory added (Linux; elsewhere `pid`'s own).
+/// [`stats`] for `pid` with its descendants' CPU and memory added (Linux and Windows; elsewhere `pid`'s own).
 pub fn tree_stats(pid: u32) -> Result<Stats, Refused> {
     let mut total = stats(pid)?;
     if total.alive != Some(true) {
@@ -207,14 +210,75 @@ fn descendants(_pid: u32) -> Vec<u32> {
     Vec::new()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read(pid: u32) -> Stats {
+    windows::read(pid)
+}
+
+#[cfg(windows)]
+fn descendants(pid: u32) -> Vec<u32> {
+    windows::descendants(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn read(_pid: u32) -> Stats {
     Stats::unknown()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn descendants(_pid: u32) -> Vec<u32> {
     Vec::new()
+}
+
+/// Windows, through `sysinfo`: CPU time from `GetProcessTimes` (user + kernel, as `/proc`'s utime + stime), memory as
+/// the working set (what Task Manager shows; Windows' resident set), the start time, and the parents from one ToolHelp
+/// snapshot. A new `System` per call: it holds a handle to every process it has seen, so one kept between refreshes
+/// would keep every process the machine ever ran in its table (and their handles open) until the next full refresh.
+#[cfg(windows)]
+mod windows {
+    use super::Stats;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    pub(super) fn read(pid: u32) -> Stats {
+        let Ok(mut system) = System::new() else { return Stats::unknown() };
+        let pid = Pid::from_u32(pid);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+        match system.process(pid) {
+            Some(p) => Stats {
+                cpu_ms: Some(p.accumulated_cpu_time()),
+                rss_kb: Some(p.memory() / 1024),
+                started_ms: Some(p.start_time() * 1000),
+                alive: Some(true),
+            },
+            // Not in the snapshot: it has ended.
+            None => Stats::gone(),
+        }
+    }
+
+    /// Every process under `pid`. Windows keeps a dead parent's id in its children, and may give that id to a new
+    /// process, so a child counts only if it started after its parent did.
+    pub(super) fn descendants(pid: u32) -> Vec<u32> {
+        let Ok(mut system) = System::new() else { return Vec::new() };
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        let processes = system.processes();
+        let mut out = Vec::new();
+        let mut queue = vec![Pid::from_u32(pid)];
+        while let Some(parent) = queue.pop() {
+            let Some(started) = processes.get(&parent).map(|p| p.start_time()) else { continue };
+            for (child, p) in processes {
+                let id = child.as_u32();
+                if p.parent() == Some(parent) && p.start_time() >= started && id != pid && !out.contains(&id) && out.len() < 256 {
+                    out.push(id);
+                    queue.push(*child);
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -385,6 +449,28 @@ mod tests {
         assert_eq!(cpu_percent((0, at(0)), (1000, at(2000))), Some(200), "two cores");
         assert_eq!(cpu_percent((5, at(0)), (5, at(10))), None, "no wall time");
         assert_eq!(cpu_percent((0, Stats::unknown()), (1000, at(10))), None);
+    }
+
+    /// Windows: a process is read with its CPU time, working set and start time, its children are found under it, and
+    /// one that ended reads as gone.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_a_process_and_its_children() {
+        let mut child = std::process::Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >NUL"]).spawn().unwrap();
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let s = windows::read(pid);
+        assert_eq!(s.alive, Some(true));
+        assert!(s.rss_kb.is_some_and(|kb| kb > 0), "{s:?}");
+        assert!(s.cpu_ms.is_some() && s.started_ms.is_some_and(|ms| ms > 0), "{s:?}");
+        assert!(!windows::descendants(pid).is_empty(), "ping runs under cmd");
+        own(pid);
+        let tree = tree_stats(pid).unwrap();
+        assert!(tree.rss_kb >= s.rss_kb, "{tree:?} vs {s:?}");
+        release(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(windows::read(pid).alive, Some(false));
     }
 
     #[cfg(unix)]

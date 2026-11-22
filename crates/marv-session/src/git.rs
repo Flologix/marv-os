@@ -139,8 +139,8 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
     if options.cancel.is_some_and(|c| c.is_cancelled()) {
         return killed;
     }
-    let env = git_environment(std::env::vars(), options.env);
-    let mut spawned = tokio::process::Command::from(marv_core::process::command("git"));
+    let env = git_environment(marv_core::process::vars(), options.env);
+    let mut spawned = tokio::process::Command::from(marv_core::process::command(git_program()));
     spawned
         .args(NO_PROGRAMS)
         .args(args)
@@ -157,7 +157,8 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
     let spawned = spawned.spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        Err(err) => return GitAsyncResult { out: err.to_string(), ..killed },
+        // Without git at all (Windows without Git for Windows) the checkpoint said "program not found".
+        Err(err) => return GitAsyncResult { out: marv_core::process::git_start_error(&err, cwd), ..killed },
     };
     let mut group = GitGroup::new(child.id());
     // Written beside the reads: a large input and a large output would otherwise wait for each other.
@@ -183,6 +184,22 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
         _ = tokio::time::sleep(options.timeout) => GitAsyncResult { timed_out: true, ..killed },
         _ = cancel.cancelled() => killed,
     }
+}
+
+/// The program run as git: "git", or in a test one that isn't there.
+#[cfg(not(test))]
+fn git_program() -> &'static str {
+    "git"
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static GIT_PROGRAM: std::cell::Cell<&'static str> = const { std::cell::Cell::new("git") };
+}
+
+#[cfg(test)]
+fn git_program() -> &'static str {
+    GIT_PROGRAM.get()
 }
 
 /// The project's commit, so a trajectory says what code a run started from (2 s at most).

@@ -831,6 +831,10 @@ impl CheckpointStore {
                 });
             }
         }
+        // No git at all: said as such, not made into a git dir of Marv's own that git can't make either.
+        if found.out == marv_core::process::GIT_MISSING {
+            return Err(found.out);
+        }
         // Not a repository (or an unusable one): Marv's own bare git dir, with the project as its work tree.
         let own_dir = self.options.own_dir.as_ref().ok_or_else(|| NOT_A_REPOSITORY.to_string())?;
         // A project folder that's gone (rev-parse failed for that) has nothing to snapshot: no git dir is made for it.
@@ -985,6 +989,23 @@ mod tests {
     fn age(path: &Path, secs: u64) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+    }
+
+    /// Without git (Windows without Git for Windows) a checkpoint's failure names Git, not "program not found", and
+    /// no git dir of Marv's own is made for it.
+    #[tokio::test]
+    async fn without_git_a_checkpoint_names_git() {
+        let repo = make_repo(true);
+        let own = temp("cp-nogit-own");
+        let store = store_in(&repo.0, "s1", &own);
+        crate::git::GIT_PROGRAM.set("marv-test-no-such-git");
+        let result = snap(&store, 1, CheckpointKind::Before, "t1").await;
+        crate::git::GIT_PROGRAM.set("git");
+        match result {
+            SnapshotResult::Failed { message, .. } => assert_eq!(message, marv_core::process::GIT_MISSING),
+            SnapshotResult::Ok { .. } => panic!("a checkpoint without git"),
+        }
+        assert!(!own.0.join("git").exists());
     }
 
     // CI's leftover-folder check: a store whose project folder was removed (a test's cleanup ran before a prune of a

@@ -480,7 +480,7 @@ pub fn about(config_dir: &std::path::Path, cap: usize) -> marv_kernel::about::Ab
         store("event log", crate::kernel_events::events_dir(config_dir)),
         store("sessions", config_dir.join("sessions")),
     ];
-    let env: marv_mcp::Env = std::env::vars().collect();
+    let env: marv_mcp::Env = marv_core::process::vars().into_iter().collect();
     if let Some(dir) = marv_mesh::discovery::mesh_dir(&env) {
         stores.push(store("doors (the mesh)", dir));
     }

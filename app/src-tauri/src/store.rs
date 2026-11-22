@@ -19,6 +19,11 @@ pub struct Settings {
     /// "openrouter", "ollama", "zai", "kimi" or "chatgpt" (#159), as chosen at onboarding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The model a new chat starts on, as onboarding or Settings → Model last picked. The page keeps it (its
+    /// `marv-settings`) and sends each pick here (`set_default_model`), so a chat started with no settings of its own
+    /// (the first chat's terminal) can name it to Marv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The OpenRouter key, when the user pasted one here (else `OPENROUTER_API_KEY` or `marv`'s own config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,

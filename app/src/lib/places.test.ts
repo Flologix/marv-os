@@ -1,7 +1,7 @@
 // `npm test`: plain Node (node:test), the TypeScript stripped.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type BudgetView, type ChatGrant, type ChatRecord, type LiveChat, type WriteMark, chatTone, dockFor, goneFolderChats, greeting, groupChats, isHomeChat, isPlace, markFor, needsYou, relUnder, samePath } from "./places.ts";
+import { type BudgetView, type ChatGrant, type ChatRecord, type LiveChat, type WriteMark, chatTone, dockFor, goneFolderChats, greeting, groupChats, isHomeChat, isPlace, markFor, needsYou, relUnder, samePath, turnEnded } from "./places.ts";
 
 const chat = (id: string, folder: string, created = 1, title = id): ChatRecord => ({ id, folder, title, created });
 const live = (id: string, more: Partial<LiveChat> = {}): LiveChat => ({ id, busy: false, waiting: 0, asleep: false, cantWake: null, paused: false, ...more });
@@ -90,4 +90,12 @@ test("chats whose folder is gone show in the nearest listed folder above it, and
   assert.deepEqual(goneFolderChats(groups, "acme", [{ name: "new", dir: true }]).map((c) => c.id), ["n"]);
   assert.deepEqual(goneFolderChats(groups, "acme", [{ name: "old", dir: true }]), []);
   assert.deepEqual(goneFolderChats(groups, "acme", undefined), [], "not listed yet: nothing is known gone");
+});
+
+test("a turn has ended only when a busy chat stops being busy", () => {
+  assert.equal(turnEnded(true, false), true);
+  assert.equal(turnEnded(false, false), false);
+  assert.equal(turnEnded(false, true), false);
+  assert.equal(turnEnded(undefined, false), false, "the first look isn't a turn's end");
+  assert.equal(turnEnded(true, undefined), false, "a chat that's gone from the list isn't either");
 });

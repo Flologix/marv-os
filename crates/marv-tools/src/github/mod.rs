@@ -54,9 +54,10 @@ const NO_PROGRAMS: [(&str, &str); 2] = [("core.hooksPath", "/dev/null"), ("core.
 /// An environment, as name/value pairs.
 pub type Env = Vec<(String, String)>;
 
-/// This process's environment (variables that aren't UTF-8 are left out).
+/// This process's environment as a child gets it (`marv_core::process::vars`: an AppImage's own variables gone,
+/// variables that aren't UTF-8 left out).
 pub fn process_env() -> Env {
-    std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
+    marv_core::process::vars()
 }
 
 fn var<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {

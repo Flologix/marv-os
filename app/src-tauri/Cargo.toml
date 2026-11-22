@@ -33,6 +33,10 @@ tauri = { version = "2.12.4", features = [] }
 tauri-plugin-dialog = "2"
 # Copy from a chat's terminal (an agent's OSC 52, ctrl+shift+c): the web view's clipboard needs a click to write.
 tauri-plugin-clipboard-manager = "2"
+# Opening Marv OS again shows the window already open, instead of a second window and process with the same chats.
+tauri-plugin-single-instance = "2"
+# Kernel #41 runs before that check, so it needs the app's folders before Tauri gives them (the same crate Tauri uses).
+dirs = "6.0"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

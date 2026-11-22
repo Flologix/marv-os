@@ -288,7 +288,8 @@ pub fn env_from_host() -> Vec<(String, String)> {
 
 /// [`env_from_host`] for an agent with these variable prefixes.
 pub fn env_from_host_for(prefixes: &[&str]) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| passed_env_for(k, prefixes)).collect();
+    let mut env: Vec<(String, String)> =
+        marv_core::process::vars().into_iter().filter(|(k, _)| passed_env_for(k, prefixes)).collect();
     if Path::new("/bin/bash").exists() {
         env.push(("SHELL".into(), "/bin/bash".into()));
     }

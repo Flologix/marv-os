@@ -414,7 +414,9 @@ pub fn map_event(
         // Runtime-kernel §16.7: the person's message a budget's limit kept from being sent, back in the prompt (Tab).
         SessionEvent::Unsent { text } => vec![UiEvent::Suggestion(text)],
         SessionEvent::CheckpointFailed { message } => {
-            // Said once while the same failure lasts (`checkpoint_turn`), so it says what follows for later turns.
+            // Said once while the same failure lasts (`checkpoint_turn`), so it says what follows for later turns. A
+            // reason that's a sentence of its own (no git) loses its full stop inside the parentheses: "…worktrees.)."
+            let message = message.trim_end().trim_end_matches('.');
             vec![system(
                 format!(
                     "This turn can't be undone: its checkpoint failed ({message}). Until that changes, later turns can't be undone either; this isn't repeated."
@@ -5633,6 +5635,19 @@ mod tests {
         assert!(matches!(&out[1], UiEvent::Subagent { title, .. } if title == "general-purpose · fix"));
         let tainted = map_event(SessionEvent::Tainted { source: marv_core::Provenance::Web }, &mut map, &t, &last);
         assert!(texts(&tainted)[0].contains("a web page"));
+    }
+
+    /// Without git the checkpoint's line names Git, and reads as one sentence (no full stop inside its parentheses).
+    #[test]
+    fn a_checkpoint_without_git_says_so_in_one_sentence() {
+        let mut map = TurnMap::default();
+        let t = view::Totals::default;
+        let last = || None;
+        let message = marv_core::process::GIT_MISSING.to_string();
+        let out = map_event(SessionEvent::CheckpointFailed { message }, &mut map, &t, &last);
+        let text = &texts(&out)[0];
+        assert!(text.contains("checkpoint failed (Git isn't installed"), "{text}");
+        assert!(text.contains("worktrees). Until") && !text.contains(".)"), "{text}");
     }
 
     #[test]

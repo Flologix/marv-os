@@ -67,7 +67,11 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
         // and as a plain notice above the turn's tool cards it read like a command's output).
         SessionEvent::CheckpointFailed { message } => Some(json!({
             "type": "checkpoint_failed",
-            "text": format!("This turn can't be undone: its checkpoint failed ({}).", first_line(message, MAX_DETAIL)),
+            // A reason that's a sentence of its own (no git) loses its full stop inside the parentheses.
+            "text": format!(
+                "This turn can't be undone: its checkpoint failed ({}).",
+                first_line(message, MAX_DETAIL).trim_end_matches('.')
+            ),
         })),
         // "Send now" messages the turn never read: the page puts them back in the composer.
         SessionEvent::NotSent { texts } => Some(json!({"type": "not_sent", "texts": texts})),
@@ -150,6 +154,8 @@ mod tests {
         let long = format!("\n\n  {}\u{1b}[31m\nmore", "é".repeat(200));
         let text = to_json(&SessionEvent::CheckpointFailed { message: long }).unwrap()["text"].as_str().unwrap().to_string();
         assert!(!text.contains('\u{1b}') && !text.contains("more") && text.contains('…'), "{text}");
+        let git = to_json(&SessionEvent::CheckpointFailed { message: marv_core::process::GIT_MISSING.into() }).unwrap();
+        assert!(git["text"].as_str().unwrap().ends_with("the Git tab and worktrees)."), "{git}");
         assert!(text.len() < 260, "{}", text.len());
         assert_eq!(first_line(" \n", 40), "no reason given");
     }

@@ -39,7 +39,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("git: {e}"))?;
+        .map_err(|e| crate::checkpoints::git_start_error(&e, dir))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {

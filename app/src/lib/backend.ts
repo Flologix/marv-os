@@ -755,6 +755,8 @@ export const desktop = {
   setChatPermissions: (id: string, mode: string) => invoke<string>("set_chat_permissions", { id, mode }),
   /** Settings' permission mode for new chats ("own": each agent's own settings). */
   setDefaultPermissions: (mode: string) => invoke<void>("set_default_permissions", { mode }),
+  /** The model new chats start on (onboarding's or Settings → Model's pick): a chat's Marv with none of its own takes it. */
+  setDefaultModel: (model: string) => invoke<void>("set_default_model", { model }),
   defaultPermissions: () => invoke<string>("default_permissions"),
   /** Ends a chat running in the background: it leaves the mesh. Opening it again continues it. */
   stopChat: (id: string) => invoke<void>("stop_chat", { id }),
@@ -882,6 +884,9 @@ export const desktop = {
   chatDeliverMail: (id: string) => invoke<void>("chat_deliver_mail", { id }),
   /** Running Marv chat `id` started on an older provider than Marv's config names now: what to tell the person. */
   chatProviderChanged: (id: string) => invoke<string | null>("chat_provider_changed", { id }),
+  /** The card when a running chat's agent started with another permission mode than the chat has now (it takes the
+   * new one when it starts again), else null. */
+  chatPermissionsChanged: (id: string) => invoke<string | null>("chat_permissions_changed", { id }),
   clipboardWrite: (text: string) => invoke<void>("clipboard_write", { text }),
   clipboardRead: () => invoke<string>("clipboard_read"),
   /** Whether the clipboard holds a picture (a screenshot), for a terminal's paste: it has no text to paste. */

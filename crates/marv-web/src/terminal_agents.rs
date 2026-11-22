@@ -585,12 +585,25 @@ impl Permissions {
     pub fn needs_sandbox(self) -> bool {
         self == Permissions::Full
     }
+
+    /// Its name inside a sentence, as the page names it (`PERMISSION_MODES` in app/src/lib/harness.ts).
+    pub fn title(self) -> &'static str {
+        match self {
+            Permissions::Own => "its own settings",
+            Permissions::Supervised => "Supervised",
+            Permissions::AutoEdits => "Auto-accept edits",
+            Permissions::Auto => "Auto",
+            Permissions::Full => "Full access",
+        }
+    }
 }
 
-/// A permission mode set on one agent: its arguments, and OpenCode's `permission` config.
+/// A permission mode set on one agent: its arguments, its environment (Marv's `MARV_YOLO`), and OpenCode's
+/// `permission` config.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PermissionSettings {
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
     pub opencode: Option<serde_json::Value>,
 }
 
@@ -598,10 +611,20 @@ pub struct PermissionSettings {
 /// agent's yet: Pi, Cursor Agent, Crush, Antigravity).
 pub fn permission_settings(agent: &Agent, mode: Permissions) -> Option<PermissionSettings> {
     use Permissions::*;
-    let args = |a: &[&str]| Some(PermissionSettings { args: a.iter().map(|s| s.to_string()).collect(), opencode: None });
+    let args = |a: &[&str]| {
+        Some(PermissionSettings { args: a.iter().map(|s| s.to_string()).collect(), ..PermissionSettings::default() })
+    };
     let opencode = |edit: &str, bash: &str| {
         let permission = serde_json::json!({"edit": edit, "bash": bash, "webfetch": "ask"});
-        Some(PermissionSettings { args: Vec::new(), opencode: Some(permission) })
+        Some(PermissionSettings { opencode: Some(permission), ..PermissionSettings::default() })
+    };
+    // Marv's yolo is on unless its config turns it off, so a chat that asks holds it off for that Marv
+    // (`MARV_YOLO=off`, which also holds `approveSandboxed` off). Without it a Supervised Marv chat started with no
+    // arguments, ran in yolo and wrote a file without asking (the Windows VM, 2026-11-22).
+    let asks = |a: &[&str]| {
+        let mut settings = args(a)?;
+        settings.env.push(("MARV_YOLO".into(), "off".into()));
+        Some(settings)
     };
     match (agent.id, mode) {
         (_, Own) => None,
@@ -620,9 +643,12 @@ pub fn permission_settings(agent: &Agent, mode: Permissions) -> Option<Permissio
         ("opencode", Supervised) => opencode("ask", "ask"),
         ("opencode", AutoEdits | Auto) => opencode("allow", "ask"),
         ("opencode", Full) => opencode("allow", "allow"),
-        // Marv asks by default and sandboxes its own commands; Full approves its edits and commits for the session.
-        (MARV, Supervised) => None,
-        (MARV, AutoEdits | Auto) => args(&["--approve", "files"]),
+        // Marv: Supervised asks for edits and commands (yolo off); auto-accept edits approves its edits, commands ask;
+        // Auto adds its yolo (sandboxed commands run unasked, as its config has it); Full approves its edits and
+        // commits for the session too.
+        (MARV, Supervised) => asks(&[]),
+        (MARV, AutoEdits) => asks(&["--approve", "files"]),
+        (MARV, Auto) => args(&["--approve", "files"]),
         (MARV, Full) => args(&["--approve", "files", "--approve", "git_write"]),
         _ => None,
     }
@@ -973,6 +999,7 @@ pub fn command(
             env.push(("MARV_RESUME_ID".into(), session.to_string()));
         }
         env.push(("MARV_SESSION_RECORD".into(), marv_session_record(events).display().to_string()));
+        env.extend(permissions.env.iter().cloned());
         // Seen idle once its terminal is quiet: the welcome's waving martian kept it "working", so a team member's
         // first task and mail, typed in once it's idle, never went in.
         env.push(("MARV_STILL".into(), "1".into()));
@@ -1259,6 +1286,11 @@ mod tests {
         assert_eq!(on("gemini", Permissions::Full).unwrap().args, ["--approval-mode", "yolo"]);
         assert_eq!(on("opencode", Permissions::AutoEdits).unwrap().opencode.unwrap()["bash"], "ask");
         assert!(on("claude-code", Permissions::Own).is_none() && on("pi", Permissions::Full).is_none());
+        // Marv: a mode that asks holds its yolo off; one that doesn't leaves it to its config.
+        let yolo_off = |mode| on("marv", mode).unwrap().env.contains(&("MARV_YOLO".to_string(), "off".to_string()));
+        assert!(yolo_off(Permissions::Supervised) && yolo_off(Permissions::AutoEdits));
+        assert!(!yolo_off(Permissions::Auto) && !yolo_off(Permissions::Full));
+        assert!(on("marv", Permissions::Own).is_none());
         // OpenCode's permission joins its mesh server in one inline config.
         let mut env = vec![("OPENCODE_CONFIG_CONTENT".to_string(), r#"{"mcp":{"marv-mesh":{}}}"#.to_string())];
         opencode_permission(&mut env, &on("opencode", Permissions::Full).unwrap().opencode.unwrap());

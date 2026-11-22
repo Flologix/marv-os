@@ -95,8 +95,8 @@ pub fn save(dir: &Path, patch: &ConfigPatch) -> Result<MarvConfig, String> {
     Ok(view(Some(&saved), None))
 }
 
-/// What the desktop's own first run chose (its `provider`, the key pasted for it, the chat's model), for a `marv` with
-/// no provider of its own yet.
+/// What the desktop's own first run chose (its `provider`, the key pasted for it, the chat's model or else its default),
+/// for a `marv` with no provider of its own yet.
 #[derive(Debug, Clone, Default)]
 pub struct DesktopChoice<'a> {
     /// The desktop's `provider` ("openrouter", "ollama", "zai", "kimi", "chatgpt"); None: OpenRouter, as `ready` reads it.
@@ -104,7 +104,11 @@ pub struct DesktopChoice<'a> {
     pub api_key: Option<&'a str>,
     pub zai_api_key: Option<&'a str>,
     pub kimi_api_key: Option<&'a str>,
+    /// The chat's own model; empty: none.
     pub model: &'a str,
+    /// The desktop's model for new chats (onboarding's or Settings → Model's pick), for a chat with no model of its own:
+    /// the first chat's terminal has no settings yet (`build_spec`), so its Marv started on the CLI's default model.
+    pub default_model: Option<&'a str>,
 }
 
 /// `file` with the desktop's choice filled in, when `marv` has no provider yet; None when there's nothing to do.
@@ -137,8 +141,11 @@ pub fn seeded(file: Option<&FileConfig>, choice: &DesktopChoice) -> Option<FileC
         ProviderKind::Kimi => next.kimi_api_key = next.kimi_api_key.or(api_key),
         _ => {}
     }
-    if next.model.as_deref().is_none_or(|m| m.trim().is_empty()) && !choice.model.trim().is_empty() {
-        next.model = Some(choice.model.trim().to_string());
+    let model = Some(choice.model).into_iter().chain(choice.default_model).map(str::trim).find(|m| !m.is_empty());
+    if next.model.as_deref().is_none_or(|m| m.trim().is_empty())
+        && let Some(model) = model
+    {
+        next.model = Some(model.to_string());
     }
     Some(next)
 }
@@ -187,6 +194,20 @@ mod tests {
         // A key of its own (no provider yet) stays its own.
         let file = FileConfig { api_key: Some("sk-or-v1-theirs".into()), ..FileConfig::default() };
         assert_eq!(seeded(Some(&file), &openrouter(Some(KEY), "m/n")).unwrap().api_key.as_deref(), Some("sk-or-v1-theirs"));
+    }
+
+    #[test]
+    fn a_chat_without_a_model_of_its_own_starts_on_the_desktops() {
+        let first = DesktopChoice { default_model: Some("moonshotai/kimi-k3"), ..openrouter(Some(KEY), "") };
+        assert_eq!(seeded(None, &first).unwrap().model.as_deref(), Some("moonshotai/kimi-k3"));
+        // The chat's own model comes first.
+        let own = DesktopChoice { default_model: Some("moonshotai/kimi-k3"), ..openrouter(Some(KEY), "z-ai/glm-5.3-flash") };
+        assert_eq!(seeded(None, &own).unwrap().model.as_deref(), Some("z-ai/glm-5.3-flash"));
+        // Neither: the file keeps no model, and `marv` takes its own default.
+        assert_eq!(seeded(None, &DesktopChoice { default_model: Some(" "), ..openrouter(Some(KEY), "") }).unwrap().model, None);
+        // A Marv set up already keeps its model.
+        let file = FileConfig { provider: Some(ProviderKind::OpenRouter), model: Some("x/y".into()), ..FileConfig::default() };
+        assert!(seeded(Some(&file), &first).is_none());
     }
 
     #[test]

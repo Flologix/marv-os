@@ -48,7 +48,7 @@ fn tokens_store(config_dir: &Path) -> McpTokenStore {
 }
 
 fn personal_servers(config_dir: &Path, home: &Path) -> Vec<McpServerConfig> {
-    let env: marv_mcp::Env = std::env::vars().collect();
+    let env: marv_mcp::Env = marv_core::process::vars().into_iter().collect();
     load_mcp_config(home, config_dir, &env, Include { personal: true, project: false }).servers
 }
 
@@ -144,7 +144,7 @@ fn manager_for(server: McpServerConfig, config_dir: &Path, home: &Path) -> Arc<M
             // Yours only: a folder's servers are trusted per folder, in a chat.
             trust: None,
             logins: Some(tokens_store(config_dir)),
-            env: std::env::vars().collect(),
+            env: marv_core::process::vars().into_iter().collect(),
             connect_timeout: CONNECT_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
         },

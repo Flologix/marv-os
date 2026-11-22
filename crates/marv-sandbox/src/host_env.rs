@@ -35,9 +35,10 @@ pub fn host_env(env: impl IntoIterator<Item = (String, String)>) -> BTreeMap<Str
     env.into_iter().filter(|(name, value)| !secret_variable(name, value)).collect()
 }
 
-/// [`host_env`] of this process's environment (variables that aren't UTF-8 are left out).
+/// [`host_env`] of this process's environment as a child gets it (`marv_core::process::vars`: an AppImage's own
+/// variables gone, variables that aren't UTF-8 left out).
 pub fn host_env_now() -> BTreeMap<String, String> {
-    host_env(std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))))
+    host_env(marv_core::process::vars())
 }
 
 /// The program a door runs on the host (gh, herdr), found on `path` the safe way: only absolute PATH entries (a

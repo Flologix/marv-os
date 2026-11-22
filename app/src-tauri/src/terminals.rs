@@ -639,6 +639,14 @@ fn spawn(
             command.env("PATH", path);
         }
         None => {
+            // The host's environment, not the AppImage's (`marv_core::process::host_env_fixes`): an agent's
+            // `python3` found the image's PYTHONHOME and died without its standard library.
+            for (name, value) in marv_core::process::host_env_fixes() {
+                match value {
+                    Some(value) => command.env(name, value),
+                    None => command.env_remove(name),
+                }
+            }
             for name in &launch.withheld {
                 command.env_remove(name);
             }
@@ -807,6 +815,31 @@ mod tests {
         assert!(!terminals.owns("chat:a", old));
         assert!(terminals.owns("chat:a", new));
         assert!(terminals.owns("chat:b", 1), "an unclaimed key has no newer owner");
+    }
+
+    /// A restart (the permission card's Restart it): the chat's terminal is closed and opened again, and the second
+    /// open starts the agent afresh rather than attaching to the one just closed.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_starts_the_agent_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminals = Terminals::default();
+        let launch = || Launch {
+            argv: vec!["sleep".into(), "30".into()],
+            path: None,
+            withheld: Vec::new(),
+            cwd: dir.path().into(),
+            keep: None,
+            env: Vec::new(),
+        };
+        let first = terminals.open_with("chat:a".into(), launch(), 80, 24, None, None, None).unwrap();
+        let before = terminals.pid("chat:a").unwrap();
+        terminals.close_key("chat:a");
+        let second = terminals.open_with("chat:a".into(), launch(), 80, 24, None, None, None).unwrap();
+        assert_ne!(first, second, "a new terminal");
+        assert!(terminals.running("chat:a"));
+        assert_ne!(terminals.pid("chat:a"), Some(before), "a new agent process");
+        terminals.close_key("chat:a");
     }
 
     /// A program on a terminal of its own: it sees a terminal of the size given, in its folder, and what's typed reaches

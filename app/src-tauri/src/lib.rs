@@ -74,6 +74,10 @@ struct Desktop {
     /// The provider in `~/.marv/config.json` when each Marv chat's terminal started with no model of its own: Marv
     /// reads its config only at start, so one set up later (OpenRouter after Ollama) didn't reach it, and nothing said so.
     started_on: Mutex<std::collections::HashMap<String, Option<String>>>,
+    /// The permission mode each chat's terminal agent started with: it's in the agent's launch (its arguments,
+    /// OpenCode's inline config), so a mode picked while it runs reaches it only when it starts again
+    /// (`chat_permissions_changed`).
+    started_mode: Mutex<std::collections::HashMap<String, marv_web::terminal_agents::Permissions>>,
     /// The Team view's reports (`teams::TeamReports`): each chat's latest report-back per stamped sender, this run.
     reports: teams::TeamReports,
     /// The grants whose expiry this app has logged.
@@ -125,6 +129,35 @@ struct WatchPlan {
 impl WatchPlan {
     fn from_env(get: impl Fn(&str) -> Option<String>, debug: bool) -> Self {
         Self { timings: watchdog::Timings::from_env(get, debug) }
+    }
+}
+
+/// This process's launcher, never taken for another window (`main.rs` runs Marv again with WebKit's renderer
+/// setting: the same program). Windows has no launcher process in between (the renderer setting is Linux's).
+fn launcher() -> Vec<u32> {
+    #[cfg(unix)]
+    return vec![std::os::unix::process::parent_id()];
+    #[cfg(not(unix))]
+    Vec::new()
+}
+
+/// Kernel #41 before Tauri starts (`run`): earlier windows that stopped responding are closed, with their reports, so
+/// the single-instance check that follows finds none of them. The folders are Tauri's own (`app_config_dir`,
+/// `app_data_dir`: the system's folder and the app's identifier), which the app gives only once it's built. The notice
+/// for the person, if a window was closed.
+fn take_over_before_start(identifier: &str) -> Option<String> {
+    WatchPlan::from_env(|k| std::env::var(k).ok(), cfg!(debug_assertions)).timings?;
+    let (config, data) = (dirs::config_dir()?.join(identifier), dirs::data_dir()?.join(identifier));
+    let chats = Store::new(config, data.clone()).chats().len();
+    take_over_hung_windows(&data, chats, &instance::Machine, std::process::id(), &launcher())
+}
+
+/// Marv OS opened again (a second launch, which then exits): its one window, shown and in front.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 
@@ -1027,6 +1060,17 @@ fn default_permissions(desktop: State<'_, Desktop>) -> String {
     permissions_word(marv_web::terminal_agents::Permissions::parse(desktop.store.settings().default_permissions.as_deref()))
 }
 
+/// The model new chats start on, as the page's onboarding or Settings → Model picked it: kept here for a chat's Marv
+/// that starts with no model of its own (`marv_config::seed`). Empty: none.
+#[tauri::command]
+fn set_default_model(desktop: State<'_, Desktop>, model: String) -> Result<(), String> {
+    let model = model.trim();
+    if !model.is_empty() && !is_model_id(model) {
+        return Err(format!("\"{model}\" isn't a model id."));
+    }
+    desktop.store.modify_settings(|settings| settings.model = (!model.is_empty()).then(|| model.to_string()))
+}
+
 /// Settings' permission mode for new chats; `own` or none: each agent's own settings.
 #[tauri::command]
 fn set_default_permissions(desktop: State<'_, Desktop>, mode: Option<String>) -> Result<(), String> {
@@ -1035,6 +1079,12 @@ fn set_default_permissions(desktop: State<'_, Desktop>, mode: Option<String>) ->
     desktop.store.modify_settings(|settings| {
         settings.default_permissions = (picked != Permissions::Own).then(|| permissions_word(picked));
     })
+}
+
+/// Whether a chat's permission mode asks before commands (Supervised, auto-accept edits): its Marv runs without yolo.
+fn permissions_ask(word: Option<&str>) -> bool {
+    use marv_web::terminal_agents::Permissions;
+    matches!(Permissions::parse(word), Permissions::Supervised | Permissions::AutoEdits)
 }
 
 fn permissions_word(mode: marv_web::terminal_agents::Permissions) -> String {
@@ -1619,6 +1669,35 @@ fn chat_provider_changed(app: AppHandle, desktop: State<'_, Desktop>, id: String
     provider_change_note(started.as_deref(), config_provider().as_deref())
 }
 
+/// The card over chat `id`'s terminal when its permission mode changed after its agent started, else None (the same
+/// settings for this agent either way: Auto and auto-accept edits are one for OpenCode). A mode is a launch argument, so a pick
+/// while the agent ran didn't reach it: an OpenCode chat switched to Supervised went on writing files without asking.
+/// A card with a restart, not a restart of its own: one would cut off a turn in progress.
+fn permission_change_note(
+    agent: &marv_web::terminal_agents::Agent,
+    started: marv_web::terminal_agents::Permissions,
+    now: marv_web::terminal_agents::Permissions,
+) -> Option<String> {
+    use marv_web::terminal_agents::permission_settings;
+    (permission_settings(agent, started) != permission_settings(agent, now))
+        .then(|| format!("{} started with {}: it takes {} when it starts again.", agent.title, started.title(), now.title()))
+}
+
+/// Whether running chat `id`'s agent started with another permission mode than the chat has now
+/// (`Desktop::started_mode`): the card over its terminal, with a restart.
+#[tauri::command]
+fn chat_permissions_changed(app: AppHandle, desktop: State<'_, Desktop>, id: String) -> Option<String> {
+    if !app.state::<terminals::Terminals>().running(&format!("chat:{id}")) {
+        return None;
+    }
+    let started = *desktop.started_mode.lock().unwrap_or_else(|e| e.into_inner()).get(&id)?;
+    let chat = desktop.chats().into_iter().find(|c| c.id == id)?;
+    let picked = marv_web::terminal_agents::Permissions::parse(chat.permissions.as_deref());
+    // As the next start would hold it (a home folder holds every mode above Supervised off).
+    let now = AppHost(app.clone()).terminal_spec(&chat).map_or(picked, |spec| picked.held(&spec));
+    permission_change_note(marv_web::terminal_agents::for_chat(chat.harness.as_deref()), started, now)
+}
+
 /// Delivers terminal chat `id`'s waiting mail (the card over its terminal).
 #[tauri::command]
 fn chat_deliver_mail(desktop: State<'_, Desktop>, id: String) -> Result<(), String> {
@@ -1798,12 +1877,14 @@ fn start_chat_terminal(
                 zai_api_key: zai_api_key.as_deref(),
                 kimi_api_key: kimi_api_key.as_deref(),
                 model: &spec.model,
+                default_model: settings.model.as_deref(),
             };
             if let Err(e) = marv_config::seed(&spec.config_dir, &choice) {
                 applog::warn("chat", &format!("Marv's config wasn't set up from the desktop's choice: {e}"));
             }
         }
         let command = marv_web::terminal_agents::command(agent, &spec, &session, again, &events, mode)?;
+        desktop.started_mode.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), mode);
         // A Marv records its session's id at start: kept as the chat's, so its next start continues it.
         if agent.id == marv_web::terminal_agents::MARV {
             // With no model of its own it runs on the config's provider, read once now (`chat_provider_changed`).
@@ -1937,7 +2018,7 @@ fn git_init_here(desktop: State<'_, Desktop>, chat: Option<String>, folder: Stri
         .current_dir(&root)
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| checkpoints::git_start_error(&e, &root))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -2163,7 +2244,9 @@ impl AppHost {
             chatgpt_auth: Some(desktop.chatgpt().path),
             model: settings.model,
             max_steps: settings.max_steps.min(500),
-            yolo: settings.yolo,
+            // A permission mode that asks holds yolo off for a headless wake too, as it does for the chat's terminal
+            // Marv (`MARV_YOLO=off`): the chat's "supervised" and a yolo left on from the page never disagree.
+            yolo: settings.yolo && !permissions_ask(chat.permissions.as_deref()),
             resume: chat.session_id.clone().map(marv_session::ResumeTarget::Id),
             // The person is at this machine: a dev server's port opens on their own 127.0.0.1.
             processes: true,
@@ -2861,22 +2944,22 @@ async fn activity(
         return Ok(marv_kernel::activity::View::default());
     };
     let mut table = marv_session::live::collect(&dir, background::MAX_LIVE).await.map_err(|e| e.to_string())?;
-    // Each chat's terminal agent, while it runs: its row's process when its door doesn't list it.
-    let pids: Vec<(String, u32)> = table
-        .rows
-        .iter()
-        .filter_map(|r| {
-            let chat = r.chat.clone()?;
-            let pid = terminals.pid(&format!("chat:{chat}"))?;
-            Some((chat, pid))
-        })
-        .collect();
+    // Each chat's terminal agent, while it runs: its row's process when its door doesn't list it. Every chat's, not
+    // only the rows' chats: a Marv chat's row is its terminal Marv's own door, which names no chat (`row_of`).
+    let pids: Vec<(String, u32)> =
+        desktop.chats().into_iter().filter_map(|c| Some((c.id.clone(), terminals.pid(&format!("chat:{}", c.id))?))).collect();
     // Off this task: macOS reads a process with `ps`.
     let rows = std::mem::take(&mut table.rows);
     table.rows = tauri::async_runtime::spawn_blocking(move || {
         let mut rows = rows;
         let mut sampler = TERMINAL_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
-        add_terminal_processes(&mut rows, &pids, |pid| sampler.sample(pid, now_ms()).ok());
+        add_terminal_processes(&mut rows, &pids, |pid| {
+            let got = sampler.sample(pid, now_ms());
+            if let Some(why) = terminal_sample_gap(pid, &got, marv_kernel::procstats::is_own(pid)) {
+                log_terminal_sample_gap(pid, &why);
+            }
+            got.ok()
+        });
         sampler.retain(&pids.iter().map(|(_, p)| *p).collect::<Vec<_>>());
         rows
     })
@@ -2885,6 +2968,31 @@ async fn activity(
     let paused: Vec<String> = desktop.live.states().into_iter().filter(|s| s.paused).map(|s| s.id).collect();
     let rules = rule_store().and_then(|s| s.load().map_err(|e| e.to_string())).map(|s| s.rules).unwrap_or_default();
     Ok(marv_kernel::activity::view(table, &paused, &rules, now_ms()))
+}
+
+/// Why a terminal agent's sample gives Activity nothing to show (its CPU and memory "—"), else None. The Windows VM
+/// showed "—" for a Marv chat's row with no way to tell why (2026-11-22): this says it in the app's log.
+fn terminal_sample_gap(
+    pid: u32,
+    got: &Result<marv_kernel::procstats::Sample, marv_kernel::procstats::Refused>,
+    own: bool,
+) -> Option<String> {
+    match got {
+        Err(_) if !own => Some(format!("pid {pid} isn't one the terminal took as its own (procstats::own)")),
+        Err(_) => Some(format!("pid {pid} was refused: its process started after Marv took the pid (taken for another)")),
+        Ok(s) if s.rss_kb.is_none() => Some(format!("pid {pid} read nothing (alive: {:?})", s.alive)),
+        Ok(_) => None,
+    }
+}
+
+/// [`terminal_sample_gap`] in the app's log, once per pid (Activity asks every few seconds).
+fn log_terminal_sample_gap(pid: u32, why: &str) {
+    static TOLD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if !told.contains(&pid) {
+        told.push(pid);
+        applog::warn("activity", &format!("no CPU or memory for a chat's terminal agent: {why}"));
+    }
 }
 
 /// The terminal agents' last samples, for their CPU % between two looks at Activity.
@@ -2896,13 +3004,23 @@ static TERMINAL_SAMPLER: std::sync::LazyLock<std::sync::Mutex<marv_kernel::procs
 /// terminal, whose own `live` lists only the servers and processes it started, never itself, and the desktop keeps no
 /// meter for it: its row showed "—" for CPU and memory (seen 2026-11-17). Its tree already holds those servers and
 /// processes, so it replaces them rather than counting them twice.
+///
+/// A row is the chat's by its chat id (a door of this app's), or, for a Marv chat, by its door's pid: a Marv chat
+/// lends its door to the Marv in its terminal, so that row's door is that Marv's, whose `marv/info` names no chat
+/// (`marv_session::live::row_of` trusts a chat id only from this process). Its pid is the kernel's word (the
+/// socket's peer credentials), the very process the terminal started. Matching by chat id alone, a Marv chat's row
+/// never matched: "—" on every OS, seen on the Windows VM (2026-11-22).
 fn add_terminal_processes(
     rows: &mut [marv_kernel::activity::AgentRow],
     pids: &[(String, u32)],
     mut sample: impl FnMut(u32) -> Option<marv_kernel::procstats::Sample>,
 ) {
     for row in rows {
-        let Some(&(_, pid)) = pids.iter().find(|(chat, _)| row.chat.as_deref() == Some(chat.as_str())) else { continue };
+        let Some(&(_, pid)) =
+            pids.iter().find(|(chat, pid)| row.chat.as_deref() == Some(chat.as_str()) || (row.chat.is_none() && row.pid == *pid))
+        else {
+            continue;
+        };
         if row.live.processes.iter().any(|p| p.pid == pid) {
             continue;
         }
@@ -4594,7 +4712,18 @@ fn own_secrets() -> marv_core::Secrets {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    let context = tauri::generate_context!();
+    // Kernel #41 first: the single-instance check below hands a second launch to the window already open and exits,
+    // so a window that stopped responding would otherwise be shown (or not) forever instead of replaced.
+    let taken_over = take_over_before_start(&context.config().identifier);
+    // A second launch shows the window already open and exits (before any other plugin starts, as the plugin asks).
+    // Only this process, the app, takes it: on Linux `main.rs`'s launcher runs this program again and waits, and
+    // never gets here, so the launcher and its app are one instance; a second launch's launcher just passes on its
+    // app's exit.
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        applog::info("start", "Marv OS was opened again: showing its window");
+        show_main_window(app);
+    }));
     // Native dialogs (and their parent window) only on a display that has them: a headless GTK backend (Broadway)
     // crashed in one. The page's dialog calls then fail and are logged (`app/src/lib/dialog.ts`).
     let builder = if native_dialogs(std::env::var("GDK_BACKEND").ok().as_deref()) {
@@ -4619,13 +4748,11 @@ pub fn run() {
             // A chat whose folder is missing stays: it may be an unmounted drive, another branch's folder, a rename or
             // a denied permission. Starting it says so (`check_chat_root`); the person deletes it.
             let plan = WatchPlan::from_env(|k| std::env::var(k).ok(), cfg!(debug_assertions));
-            // Never this process's launcher (`main.rs` runs Marv again with WebKit's renderer setting): the same program.
-            #[cfg(unix)]
-            let skip = [std::os::unix::process::parent_id()];
-            // Windows: no launcher process in between (the renderer setting is Linux's).
-            #[cfg(not(unix))]
-            let skip: [u32; 0] = [];
-            let (notice, own) = start_instances(&data, &plan, store.chats().len(), &instance::Machine, &skip);
+            let (notice, own) = start_instances(&data, &plan, store.chats().len(), &instance::Machine, &launcher());
+            if taken_over.is_some() {
+                applog::warn("start", "an earlier Marv window had stopped responding; it was closed before this one started");
+            }
+            let notice = taken_over.or(notice);
             // The first argument that isn't a flag: `marv-desktop .`, `marv-desktop ~/Projects/site`.
             let launch = std::env::args().skip(1).find(|a| !a.starts_with('-'));
             let live = chats::Chats::new(std::sync::Arc::new(AppHost(app.handle().clone())));
@@ -4662,6 +4789,7 @@ pub fn run() {
                 // The watchdog's stop notices from the last run, told in each chat as it loads.
                 notices: Mutex::new(watchdog::take_notices(&data)),
                 started_on: Mutex::default(),
+                started_mode: Mutex::default(),
                 reports: teams::TeamReports::default(),
                 grant_expiries: Mutex::default(),
                 meters: Some(std::sync::Arc::new(marv_session::allocator::MeterBook::for_person(
@@ -4766,6 +4894,7 @@ pub fn run() {
             set_chat_private,
             set_chat_permissions,
             set_default_permissions,
+            set_default_model,
             default_permissions,
             delete_chat,
             create_chat,
@@ -4795,6 +4924,7 @@ pub fn run() {
             chat_turn_restore,
             chat_deliver_mail,
             chat_provider_changed,
+            chat_permissions_changed,
             clipboard_read,
             clipboard_has_image,
             git_terminal_resize,
@@ -4851,7 +4981,7 @@ pub fn run() {
             hang_reports,
             open_hang_reports,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while running Marv desktop")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
@@ -5257,7 +5387,7 @@ async fn switch_agent(
 fn chat_book(desktop: &Desktop, id: &str) -> Result<checkpoints::Book, String> {
     let chat = desktop.chats().into_iter().find(|c| c.id == id).ok_or("That chat is gone.")?;
     let (dir, _) = work_root(&chat)?;
-    checkpoints::book_for(id, &dir, desktop.store.data_dir()).ok_or_else(|| {
+    checkpoints::find_book(id, &dir, desktop.store.data_dir())?.ok_or_else(|| {
         "Turns are kept in a git repository: this chat's folder isn't in one (Git in the dock can start one).".into()
     })
 }
@@ -5371,19 +5501,24 @@ mod tests {
             cpu_pct: Some(0),
             alive: Some(true),
         };
-        let row = |chat: Option<&str>, processes| AgentRow {
+        let row = |chat: Option<&str>, door: u32, processes| AgentRow {
             name: "n".into(),
             folder: "/w".into(),
             kind: RowKind::Chat,
             chat: chat.map(String::from),
-            pid: 1,
+            pid: door,
             state: None,
             title: None,
             last_active_ms: None,
             live: Live { processes, ..Default::default() },
         };
-        let mut rows =
-            vec![row(Some("marv"), vec![listed(4_000_000)]), row(Some("claude"), vec![listed(pid)]), row(None, Vec::new())];
+        let mut rows = vec![
+            row(Some("marv"), 1, vec![listed(4_000_000)]),
+            row(Some("claude"), 1, vec![listed(pid)]),
+            row(None, 1, Vec::new()),
+            // A Marv chat's terminal Marv on the chat's lent door: no chat id, its door's pid the agent's.
+            row(None, pid, Vec::new()),
+        ];
         let before = rows.clone();
         let pids = vec![("marv".to_string(), pid), ("claude".to_string(), pid)];
         let mut sampler = marv_kernel::procstats::Sampler::default();
@@ -5394,7 +5529,8 @@ mod tests {
         assert_eq!(shown.len(), 1, "the agent's tree, not it and its server counted twice: {shown:?}");
         assert_eq!(shown[0].pid, pid);
         assert!(shown[0].rss_kb.is_some_and(|kb| kb > 0), "its memory: {shown:?}");
-        assert_eq!(rows[1..], before[1..]);
+        assert_eq!(rows[1..3], before[1..3]);
+        assert_eq!(rows[3].live.processes.first().map(|p| p.pid), Some(pid), "the lent door's Marv, by its pid");
     }
 
     /// A team in worktrees has a board per rule: the Teams screen shows them as one, oldest first, and your post, kept
@@ -5434,6 +5570,47 @@ mod tests {
         );
         assert!(provider_change_note(Some("openrouter"), Some("openrouter")).is_none());
         assert!(provider_change_note(None, Some("ollama")).unwrap().starts_with("This chat's Marv started on no provider"));
+    }
+
+    /// Activity's "—" for a terminal agent says why in the log: a pid never taken, one refused as reused, or a read
+    /// that found nothing.
+    #[test]
+    fn a_terminal_agent_without_numbers_says_why() {
+        use marv_kernel::procstats::{Refused, Sample};
+        assert!(terminal_sample_gap(7, &Err(Refused), false).unwrap().contains("isn't one the terminal took"));
+        assert!(terminal_sample_gap(7, &Err(Refused), true).unwrap().contains("refused"));
+        let empty = Sample { rss_kb: None, cpu_pct: None, alive: None };
+        assert_eq!(terminal_sample_gap(7, &Ok(empty), true).as_deref(), Some("pid 7 read nothing (alive: None)"));
+        let read = Sample { rss_kb: Some(1024), cpu_pct: None, alive: Some(true) };
+        assert!(terminal_sample_gap(7, &Ok(read), true).is_none(), "the first sample has no CPU % yet, but memory");
+    }
+
+    /// A mode that asks holds a chat's yolo off, headless as in its terminal.
+    #[test]
+    fn a_mode_that_asks_holds_yolo_off() {
+        assert!(permissions_ask(Some("supervised")) && permissions_ask(Some("auto-edits")));
+        assert!(!permissions_ask(Some("auto")) && !permissions_ask(Some("full")) && !permissions_ask(None));
+    }
+
+    /// A permission mode picked while a chat's agent runs is in its launch, so it waits for a restart: the card says
+    /// which, and only when the agent's settings for the two modes differ.
+    #[test]
+    fn a_mode_picked_while_the_agent_runs_waits_for_its_restart() {
+        use marv_web::terminal_agents::{Permissions, for_chat, permission_settings};
+        let opencode = for_chat(Some("opencode"));
+        assert_eq!(
+            permission_change_note(opencode, Permissions::AutoEdits, Permissions::Supervised).as_deref(),
+            Some("OpenCode started with Auto-accept edits: it takes Supervised when it starts again.")
+        );
+        // The next start carries it: OpenCode asks before edits and commands.
+        let next = permission_settings(opencode, Permissions::Supervised).unwrap().opencode.unwrap();
+        assert_eq!((next["edit"].as_str(), next["bash"].as_str()), (Some("ask"), Some("ask")));
+        assert!(permission_change_note(opencode, Permissions::Supervised, Permissions::Supervised).is_none());
+        assert!(permission_change_note(opencode, Permissions::AutoEdits, Permissions::Auto).is_none(), "the same settings");
+        assert!(permission_change_note(for_chat(Some("pi")), Permissions::Own, Permissions::Full).is_none(), "Pi's own settings");
+        let marv = for_chat(None);
+        assert!(permission_change_note(marv, Permissions::Own, Permissions::Supervised).unwrap().contains("Supervised"));
+        assert!(permission_change_note(marv, Permissions::Supervised, Permissions::Full).unwrap().contains("Full access"));
     }
 
     /// Teams and Apps need a sign-in on this computer, free or paid: none (or a broken plan.json) is refused with the

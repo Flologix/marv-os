@@ -582,17 +582,35 @@ function ChatTerminal({ chat, chatId }: { chat: Chat; chatId: string }) {
     const timer = window.setInterval(look, 5000);
     return () => window.clearInterval(timer);
   }, [chatId, isMarv, state]);
-  const restart = () => void desktop.chatTerminalClose(chatId).then(() => (setSaid(null), again()), () => {});
+  // A permission mode picked while its agent runs is in the agent's launch: it applies from its next start, said here
+  // with a restart (not restarted by itself: that would cut off a turn in progress).
+  const [modeNote, setModeNote] = useState<string | null>(null);
+  useEffect(() => {
+    if (state !== "running") return setModeNote(null);
+    const look = () => desktop.chatPermissionsChanged(chatId).then(setModeNote, () => {});
+    look();
+    const timer = window.setInterval(look, 3000);
+    // A pick in the permission menu shows its card at once, not at the next look.
+    const picked = (e: Event) => (e as CustomEvent<string>).detail === chatId && look();
+    window.addEventListener(PERMISSIONS_PICKED, picked);
+    return () => (window.clearInterval(timer), window.removeEventListener(PERMISSIONS_PICKED, picked));
+  }, [chatId, state]);
+  const restart = () => void desktop.chatTerminalClose(chatId).then(() => (setSaid(null), setModeNote(null), again()), () => {});
   return (
     <main className="chat-term">
-      {providerNote && (
+      {(providerNote || modeNote) && (
         <div className="chat-term-cards">
-          <div className="mail-card">
-            <span>{providerNote}</span>
-            <button className="btn" onClick={restart}>
-              Restart it
-            </button>
-          </div>
+          {[providerNote, modeNote].map(
+            (note) =>
+              note && (
+                <div key={note} className="mail-card">
+                  <span>{note}</span>
+                  <button className="btn" onClick={restart}>
+                    Restart it
+                  </button>
+                </div>
+              ),
+          )}
         </div>
       )}
       {(cards.length > 0 || mail.length > 0 || mailError || error) && (
@@ -1160,27 +1178,32 @@ function TurnsChip({ chatId }: { chatId: string }) {
   );
 }
 
+/** A pick in the permission menu, for the card over the chat's terminal (its detail: the chat's id). */
+const PERMISSIONS_PICKED = "marv-permissions-picked";
+
 /** The chat's permission mode (the same four for every agent): picked here, taken by its agent when its terminal next
- * starts, so a running one offers a restart. */
+ * starts. A running agent that started with another gets the card over its terminal, whose Restart it starts it again
+ * on its conversation: this menu only ended it (the chat said "Marv exited"), and said "takes it when its terminal
+ * starts again" before anything was changed. */
 function PermissionChip({ chatId }: { chatId: string }) {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<string | null>(null);
   const [said, setSaid] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
   // Full access is offered only where Marv's sandbox can run (not on Windows yet).
   const [sandbox, setSandbox] = useState(true);
   useEffect(() => {
     desktop.info().then((i) => setSandbox(i.sandbox), () => {});
     desktop.chats().then((all) => setMode(all.find((c) => c.id === chatId)?.permissions ?? "own"), () => setMode("own"));
   }, [chatId]);
-  useEffect(() => {
-    if (open) void desktop.chatTerminalRunning(chatId).then(setRunning, () => setRunning(false));
-  }, [open, chatId]);
   async function pick(id: string) {
     try {
       const held = await desktop.setChatPermissions(chatId, id);
       setMode(id);
-      setSaid(held !== id ? `This folder holds it at ${permissionName(held)}: Marv never runs without asking in your home folder.` : null);
+      window.dispatchEvent(new CustomEvent(PERMISSIONS_PICKED, { detail: chatId }));
+      // Done: the menu closes, unless the folder holds the pick lower, which it says first.
+      const holds = held !== id ? `This folder holds it at ${permissionName(held)}: Marv never runs without asking in your home folder.` : null;
+      setSaid(holds);
+      if (!holds) setOpen(false);
     } catch (e) {
       setSaid(String(e));
     }
@@ -1202,14 +1225,6 @@ function PermissionChip({ chatId }: { chatId: string }) {
             </label>
           ))}
           {said && <p className="notice small">{said}</p>}
-          {running && (
-            <div className="branch-actions">
-              <span className="muted small grow">Its agent takes it when its terminal starts again.</span>
-              <button className="btn" onClick={() => void desktop.chatTerminalClose(chatId).then(() => setRunning(false), () => {})}>
-                Restart it
-              </button>
-            </div>
-          )}
         </div>
       )}
     </span>

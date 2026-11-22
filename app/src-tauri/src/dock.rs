@@ -54,7 +54,10 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .env_remove("GIT_EXTERNAL_DIFF")
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("git didn't run: {e}"))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound if dir.is_dir() => crate::checkpoints::GIT_MISSING.to_string(),
+            _ => format!("git didn't run: {e}"),
+        })?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let first = err.lines().next().unwrap_or("git failed").trim();

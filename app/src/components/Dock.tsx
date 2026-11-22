@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { type Changes, type Entry, type MeshRule, type WriteMark, desktop } from "../lib/backend";
 import { say } from "../lib/dialog";
 import type { useChat } from "../lib/chat";
-import { DOCK_TABS, type DockTab, HOME_FOLDER, markFor } from "../lib/places";
+import { DOCK_TABS, type DockTab, HOME_FOLDER, markFor, turnEnded } from "../lib/places";
 import { Board } from "./Board";
 import { TermView, forgetTerm } from "./TermView";
 import { ruleName } from "./Teams";
@@ -23,6 +23,7 @@ export function Dock({
   team,
   tab: asked,
   onTab,
+  busy,
 }: {
   /** The chat; null for a draft (its folder's files only). */
   chatId: string | null;
@@ -33,6 +34,8 @@ export function Dock({
   team: boolean;
   tab: DockTab;
   onTab: (tab: DockTab) => void;
+  /** The chat's agent is working (`LiveChat::busy`): its files are read again when its turn ends. */
+  busy?: boolean;
 }) {
   const tabs = DOCK_TABS.filter((t) => t !== "board" || (team && chatId));
   const tab = tabs.includes(asked) ? asked : "files";
@@ -46,7 +49,7 @@ export function Dock({
         ))}
       </div>
       <div className={`dock-body${tab === "git" ? " flush" : ""}`}>
-        {tab === "files" && (chatId || folder !== HOME_FOLDER ? <Files chatId={chatId} folder={folder} /> : <Draft />)}
+        {tab === "files" && (chatId || folder !== HOME_FOLDER ? <Files chatId={chatId} folder={folder} busy={busy} /> : <Draft />)}
         {tab === "git" && (chatId || folder !== HOME_FOLDER ? <GitTab key={chatId ?? folder} chatId={chatId} folder={folder} /> : <Draft />)}
         {tab === "board" && (chatId ? <BoardTab chatId={chatId} meshName={chat.meshName} /> : <Draft />)}
       </div>
@@ -145,7 +148,7 @@ function Draft() {
 }
 
 /** The chat's own folder (its worktree when it has one), a level at a time; marked files say who wrote them lately. */
-function Files({ chatId, folder }: { chatId: string | null; folder: string }) {
+function Files({ chatId, folder, busy }: { chatId: string | null; folder: string; busy?: boolean }) {
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
   const [marks, setMarks] = useState<WriteMark[]>([]);
@@ -189,11 +192,25 @@ function Files({ chatId, folder }: { chatId: string | null; folder: string }) {
     return () => clearInterval(timer);
   }, [chatId]);
 
-  // Marv changes files: what's open is read again every few seconds.
+  // Agents change files: what's open is read again every few seconds while the window shows, and at once when it
+  // shows again or the chat's agent ends a turn. With the timer alone a file an agent had just made (an OpenCode
+  // chat's hello.py) showed only at the next look, and none came while the window counted as hidden.
   useEffect(() => {
-    const timer = setInterval(() => document.visibilityState === "visible" && open.forEach((rel) => void load(rel)), 5000);
-    return () => clearInterval(timer);
+    const again = () => document.visibilityState === "visible" && open.forEach((rel) => void load(rel));
+    const timer = setInterval(again, 5000);
+    window.addEventListener("focus", again);
+    document.addEventListener("visibilitychange", again);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", again);
+      document.removeEventListener("visibilitychange", again);
+    };
   }, [open, load]);
+  const wasBusy = useRef(busy);
+  useEffect(() => {
+    if (turnEnded(wasBusy.current, busy)) open.forEach((rel) => void load(rel));
+    wasBusy.current = busy;
+  }, [busy, open, load]);
 
   function toggle(rel: string) {
     setOpen((o) => {
