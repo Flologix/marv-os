@@ -1785,6 +1785,24 @@ fn start_chat_terminal(
         let events = marv_dir().join("terminals").join(format!("{id}.jsonl"));
         std::fs::create_dir_all(events.parent().unwrap_or(&events)).map_err(|e| e.to_string())?;
         std::fs::write(&events, "").map_err(|e| e.to_string())?;
+        // A Marv reads its own config: the desktop's first-run choice goes in when it has no provider yet, else its
+        // terminal opened Marv's setup and asked again for the key just pasted (and started on no provider).
+        // The keys from the desktop itself: a terminal's spec carries none (`build_spec`: Marv's keys don't apply to a
+        // terminal's agent), so the spec's empty key left the first Windows build of this asking again.
+        if agent.id == marv_web::terminal_agents::MARV {
+            let settings = desktop.store.settings();
+            let (api_key, zai_api_key, kimi_api_key) = (desktop.api_key(), desktop.zai_key(), desktop.kimi_key());
+            let choice = marv_config::DesktopChoice {
+                provider: settings.provider.as_deref(),
+                api_key: api_key.as_deref(),
+                zai_api_key: zai_api_key.as_deref(),
+                kimi_api_key: kimi_api_key.as_deref(),
+                model: &spec.model,
+            };
+            if let Err(e) = marv_config::seed(&spec.config_dir, &choice) {
+                applog::warn("chat", &format!("Marv's config wasn't set up from the desktop's choice: {e}"));
+            }
+        }
         let command = marv_web::terminal_agents::command(agent, &spec, &session, again, &events, mode)?;
         // A Marv records its session's id at start: kept as the chat's, so its next start continues it.
         if agent.id == marv_web::terminal_agents::MARV {
@@ -2834,15 +2852,70 @@ fn write_overlaps(desktop: State<'_, Desktop>) -> Vec<WriteOverlapView> {
 /// Marvs, each from its door's `marv/info` (`marv_session::live::collect`), with the pauses this app knows and the
 /// teams of the person's rules. For the person's eyes only: the page renders it, nothing offers it to a model.
 #[tauri::command]
-async fn activity(desktop: State<'_, Desktop>) -> Result<marv_kernel::activity::View, String> {
+async fn activity(
+    desktop: State<'_, Desktop>,
+    terminals: State<'_, terminals::Terminals>,
+) -> Result<marv_kernel::activity::View, String> {
     let env: marv_mcp::Env = std::env::vars().collect();
     let Some(dir) = marv_mesh::discovery::mesh_dir(&env) else {
         return Ok(marv_kernel::activity::View::default());
     };
-    let table = marv_session::live::collect(&dir, background::MAX_LIVE).await.map_err(|e| e.to_string())?;
+    let mut table = marv_session::live::collect(&dir, background::MAX_LIVE).await.map_err(|e| e.to_string())?;
+    // Each chat's terminal agent, while it runs: its row's process when its door doesn't list it.
+    let pids: Vec<(String, u32)> = table
+        .rows
+        .iter()
+        .filter_map(|r| {
+            let chat = r.chat.clone()?;
+            let pid = terminals.pid(&format!("chat:{chat}"))?;
+            Some((chat, pid))
+        })
+        .collect();
+    // Off this task: macOS reads a process with `ps`.
+    let rows = std::mem::take(&mut table.rows);
+    table.rows = tauri::async_runtime::spawn_blocking(move || {
+        let mut rows = rows;
+        let mut sampler = TERMINAL_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+        add_terminal_processes(&mut rows, &pids, |pid| sampler.sample(pid, now_ms()).ok());
+        sampler.retain(&pids.iter().map(|(_, p)| *p).collect::<Vec<_>>());
+        rows
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let paused: Vec<String> = desktop.live.states().into_iter().filter(|s| s.paused).map(|s| s.id).collect();
     let rules = rule_store().and_then(|s| s.load().map_err(|e| e.to_string())).map(|s| s.rules).unwrap_or_default();
     Ok(marv_kernel::activity::view(table, &paused, &rules, now_ms()))
+}
+
+/// The terminal agents' last samples, for their CPU % between two looks at Activity.
+static TERMINAL_SAMPLER: std::sync::LazyLock<std::sync::Mutex<marv_kernel::procstats::Sampler>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A chat row whose door doesn't list its terminal agent's process gets it from here, measured with everything it
+/// runs (`pids`: chat id, the agent's pid, which the terminal started). A Marv chat lends its door to the Marv in its
+/// terminal, whose own `live` lists only the servers and processes it started, never itself, and the desktop keeps no
+/// meter for it: its row showed "—" for CPU and memory (seen 2026-11-17). Its tree already holds those servers and
+/// processes, so it replaces them rather than counting them twice.
+fn add_terminal_processes(
+    rows: &mut [marv_kernel::activity::AgentRow],
+    pids: &[(String, u32)],
+    mut sample: impl FnMut(u32) -> Option<marv_kernel::procstats::Sample>,
+) {
+    for row in rows {
+        let Some(&(_, pid)) = pids.iter().find(|(chat, _)| row.chat.as_deref() == Some(chat.as_str())) else { continue };
+        if row.live.processes.iter().any(|p| p.pid == pid) {
+            continue;
+        }
+        let Some(got) = sample(pid) else { continue };
+        row.live.processes = vec![marv_kernel::metrics::ChildProcess {
+            kind: marv_kernel::metrics::ProcessKind::Process,
+            name: "agent".into(),
+            pid,
+            rss_kb: got.rss_kb,
+            cpu_pct: got.cpu_pct,
+            alive: got.alive,
+        }];
+    }
 }
 
 /// (chat id, mesh name) for the desktop's chats: the timeline names a chat registered before today's log.
@@ -4362,10 +4435,19 @@ fn team_of(desktop: &Desktop, id: u64) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// "Stop the team" (§15.3): every chat rule `id` covers is paused and its turn stopped. How many were running.
+/// "Stop the team" (§15.3): every chat rule `id` covers is paused and its turn stopped, and its agent's terminal ends
+/// with its whole session, as closing it does (paused, the members' agents and what they started ran on until their
+/// chats were deleted; seen 2026-11-17). A paused chat isn't woken, so mail doesn't start it again until resumed. How
+/// many were running.
 #[tauri::command]
-fn stop_team(desktop: State<'_, Desktop>, id: u64) -> Result<usize, String> {
-    Ok(desktop.live.stop_team(&team_of(&desktop, id)?))
+fn stop_team(desktop: State<'_, Desktop>, terminals: State<'_, terminals::Terminals>, id: u64) -> Result<usize, String> {
+    let team = team_of(&desktop, id)?;
+    let paused = desktop.live.stop_team(&team);
+    let ended = terminals.close_chats(&team);
+    for chat in &ended {
+        desktop.live.terminal_closed(chat);
+    }
+    Ok(paused.max(ended.len()))
 }
 
 /// "Resume the team": every paused chat rule `id` covers runs again. How many were paused.
@@ -4601,7 +4683,7 @@ pub fn run() {
                 #[cfg(target_os = "linux")]
                 watch_web_process(app);
             }
-            // P2-6: SIGTERM (a later launch closing this window, a logout) closes the normal way.
+            // P2-6: SIGTERM (a later launch closing this window, a logout) and SIGINT close the normal way.
             tauri::async_runtime::spawn(close_on_sigterm(app.handle().clone()));
             // Runtime-kernel §15: the kernel's tick (timers due, grants ended under an unattended turn).
             let ticker = app.handle().clone();
@@ -4988,14 +5070,21 @@ async fn close_on_sigterm(app: AppHandle) {
     close(&app).await;
 }
 
+/// Unix: SIGINT too (Ctrl+C where it was started, or the launcher passing it on): its default ended the process
+/// without the exit's cleanup, and the agents, each in a session of its own, ran on.
 #[cfg(unix)]
 async fn close_on_sigterm(app: AppHandle) {
     use tokio::signal::unix::{SignalKind, signal};
-    let Ok(mut term) = signal(SignalKind::terminate()) else { return };
-    if term.recv().await.is_some() {
-        applog::info("exit", "asked to close (SIGTERM)");
-        close(&app).await;
-    }
+    let (Ok(mut term), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        return;
+    };
+    let got = tokio::select! {
+        Some(()) = term.recv() => "SIGTERM",
+        Some(()) = interrupt.recv() => "SIGINT",
+        else => return,
+    };
+    applog::info("exit", &format!("asked to close ({got})"));
+    close(&app).await;
 }
 
 /// Closes the app: chats with a turn running are stopped through the person's stop path (each told why when it
@@ -5263,6 +5352,50 @@ fn logs_recent() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Marv chat's row (its door lent to the terminal's Marv, which lists only what it started) gets its terminal
+    /// agent's process, measured; a row that lists that process already, and a row that's no chat, are left alone.
+    #[cfg(target_os = "linux")] // memory read from `/proc`
+    #[test]
+    fn activity_measures_a_terminal_agent_its_door_doesnt_list() {
+        use marv_kernel::activity::{AgentRow, RowKind};
+        use marv_kernel::metrics::{ChildProcess, Live, ProcessKind};
+        let mut agent = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = agent.id();
+        marv_kernel::procstats::own(pid);
+        let listed = |pid| ChildProcess {
+            kind: ProcessKind::Mcp,
+            name: "srv".into(),
+            pid,
+            rss_kb: Some(1),
+            cpu_pct: Some(0),
+            alive: Some(true),
+        };
+        let row = |chat: Option<&str>, processes| AgentRow {
+            name: "n".into(),
+            folder: "/w".into(),
+            kind: RowKind::Chat,
+            chat: chat.map(String::from),
+            pid: 1,
+            state: None,
+            title: None,
+            last_active_ms: None,
+            live: Live { processes, ..Default::default() },
+        };
+        let mut rows =
+            vec![row(Some("marv"), vec![listed(4_000_000)]), row(Some("claude"), vec![listed(pid)]), row(None, Vec::new())];
+        let before = rows.clone();
+        let pids = vec![("marv".to_string(), pid), ("claude".to_string(), pid)];
+        let mut sampler = marv_kernel::procstats::Sampler::default();
+        add_terminal_processes(&mut rows, &pids, |p| sampler.sample(p, now_ms()).ok());
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let shown = &rows[0].live.processes;
+        assert_eq!(shown.len(), 1, "the agent's tree, not it and its server counted twice: {shown:?}");
+        assert_eq!(shown[0].pid, pid);
+        assert!(shown[0].rss_kb.is_some_and(|kb| kb > 0), "its memory: {shown:?}");
+        assert_eq!(rows[1..], before[1..]);
+    }
 
     /// A team in worktrees has a board per rule: the Teams screen shows them as one, oldest first, and your post, kept
     /// once in each, once.

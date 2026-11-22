@@ -1,7 +1,7 @@
 // `npm test`: plain Node (node:test), the TypeScript stripped.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type BudgetView, type ChatGrant, type ChatRecord, type LiveChat, type WriteMark, chatTone, dockFor, greeting, groupChats, isHomeChat, isPlace, markFor, needsYou, relUnder, samePath } from "./places.ts";
+import { type BudgetView, type ChatGrant, type ChatRecord, type LiveChat, type WriteMark, chatTone, dockFor, goneFolderChats, greeting, groupChats, isHomeChat, isPlace, markFor, needsYou, relUnder, samePath } from "./places.ts";
 
 const chat = (id: string, folder: string, created = 1, title = id): ChatRecord => ({ id, folder, title, created });
 const live = (id: string, more: Partial<LiveChat> = {}): LiveChat => ({ id, busy: false, waiting: 0, asleep: false, cantWake: null, paused: false, ...more });
@@ -79,4 +79,15 @@ test("places, greetings and the dock's remembered state", () => {
   assert.deepEqual(dockFor({ c1: { open: false, tab: "board" } }, "c1", last), { open: false, tab: "board" });
   assert.deepEqual(dockFor({}, "c2", last), last);
   assert.deepEqual(dockFor({ c3: { open: true, tab: "nope" as never } }, "c3", last), last);
+});
+
+// Seen 2026-11-17: a chat whose folder was renamed away had no row in the Folders tree, so no Delete anywhere.
+test("chats whose folder is gone show in the nearest listed folder above it, and only once it is listed", () => {
+  const chats = [chat("a", "/w/acme"), chat("g", "/w/gone"), chat("n", "/w/acme/old/deep"), chat("t", "/w")];
+  const groups = groupChats(chats, "/w", "w", "");
+  const top = [{ name: "acme", dir: true }, { name: "gone", dir: false }];
+  assert.deepEqual(goneFolderChats(groups, "", top).map((c) => c.id), ["g"], "a file named gone isn't its folder");
+  assert.deepEqual(goneFolderChats(groups, "acme", [{ name: "new", dir: true }]).map((c) => c.id), ["n"]);
+  assert.deepEqual(goneFolderChats(groups, "acme", [{ name: "old", dir: true }]), []);
+  assert.deepEqual(goneFolderChats(groups, "acme", undefined), [], "not listed yet: nothing is known gone");
 });

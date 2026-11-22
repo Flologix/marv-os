@@ -1,9 +1,11 @@
 //! The few settings of Marv's own file (`~/.marv/config.json`, shared with `marv`) the desktop's Settings and Teams
 //! show (kernel #53): `smallModel`, and the mesh's `wake`, `radio` and `cards`. Each change is the person's click, saved
 //! merged with the file as it is now (`ConfigStore::save_merged`), so a running `marv`'s own save isn't lost.
+//! And [`seed`]: the desktop's first-run choice, for a `marv` that has no provider yet.
 
 use std::path::Path;
 
+use marv_provider::ProviderKind;
 use marv_session::config::{ConfigStore, FileConfig, RadioSetting};
 use serde::{Deserialize, Serialize};
 
@@ -93,9 +95,125 @@ pub fn save(dir: &Path, patch: &ConfigPatch) -> Result<MarvConfig, String> {
     Ok(view(Some(&saved), None))
 }
 
+/// What the desktop's own first run chose (its `provider`, the key pasted for it, the chat's model), for a `marv` with
+/// no provider of its own yet.
+#[derive(Debug, Clone, Default)]
+pub struct DesktopChoice<'a> {
+    /// The desktop's `provider` ("openrouter", "ollama", "zai", "kimi", "chatgpt"); None: OpenRouter, as `ready` reads it.
+    pub provider: Option<&'a str>,
+    pub api_key: Option<&'a str>,
+    pub zai_api_key: Option<&'a str>,
+    pub kimi_api_key: Option<&'a str>,
+    pub model: &'a str,
+}
+
+/// `file` with the desktop's choice filled in, when `marv` has no provider yet; None when there's nothing to do.
+/// The desktop's first run saved its choice in its own settings only, so the Marv in a chat's terminal (which reads
+/// this file) opened its own setup and asked again for the key just pasted, and the chat's "started on no provider"
+/// banner stayed up after it. Only a file without a provider is filled, and only fields it doesn't have: a person's
+/// own `marv` setup is never changed.
+pub fn seeded(file: Option<&FileConfig>, choice: &DesktopChoice) -> Option<FileConfig> {
+    if file.is_some_and(|f| f.provider.is_some()) {
+        return None;
+    }
+    let key = |k: Option<&str>| k.map(str::trim).filter(|k| !k.is_empty()).map(str::to_string);
+    let mut next = file.cloned().unwrap_or_default();
+    let (provider, api_key) = match choice.provider {
+        None | Some("openrouter") => (ProviderKind::OpenRouter, key(choice.api_key)),
+        Some("ollama") => (ProviderKind::Ollama, None),
+        Some("zai") => (ProviderKind::Zai, key(choice.zai_api_key)),
+        Some("kimi") => (ProviderKind::Kimi, key(choice.kimi_api_key)),
+        Some("chatgpt") => (ProviderKind::ChatGpt, None),
+        Some(_) => return None,
+    };
+    // A provider that needs a key it hasn't got is left to `marv`'s setup, which asks for it.
+    if matches!(provider, ProviderKind::OpenRouter | ProviderKind::Zai | ProviderKind::Kimi) && api_key.is_none() {
+        return None;
+    }
+    next.provider = Some(provider);
+    match provider {
+        ProviderKind::OpenRouter => next.api_key = next.api_key.or(api_key),
+        ProviderKind::Zai => next.zai_api_key = next.zai_api_key.or(api_key),
+        ProviderKind::Kimi => next.kimi_api_key = next.kimi_api_key.or(api_key),
+        _ => {}
+    }
+    if next.model.as_deref().is_none_or(|m| m.trim().is_empty()) && !choice.model.trim().is_empty() {
+        next.model = Some(choice.model.trim().to_string());
+    }
+    Some(next)
+}
+
+/// [`seeded`], saved: before a chat's Marv starts. Whether the file changed.
+pub fn seed(dir: &Path, choice: &DesktopChoice) -> Result<bool, String> {
+    let store = ConfigStore::new(dir);
+    // A file that can't be read isn't written over: `marv` says what's wrong with it.
+    let base = store.load().map_err(|e| e.to_string())?;
+    let Some(next) = seeded(base.as_ref(), choice) else { return Ok(false) };
+    store.save_merged(&next, base.as_ref()).map_err(|e| format!("Couldn't save your Marv settings: {e}"))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEY: &str = "sk-or-v1-0123456789abcdef0123456789abcdef";
+
+    fn openrouter<'a>(key: Option<&'a str>, model: &'a str) -> DesktopChoice<'a> {
+        DesktopChoice { provider: Some("openrouter"), api_key: key, model, ..DesktopChoice::default() }
+    }
+
+    #[test]
+    fn a_first_run_choice_fills_a_marv_without_a_provider() {
+        let next = seeded(None, &openrouter(Some(KEY), "z-ai/glm-5.3-flash")).unwrap();
+        assert_eq!(next.provider, Some(ProviderKind::OpenRouter));
+        assert_eq!(next.api_key.as_deref(), Some(KEY));
+        assert_eq!(next.model.as_deref(), Some("z-ai/glm-5.3-flash"));
+        // What `marv` checks before opening its setup.
+        let env = marv_session::config::Env::new();
+        let config = marv_session::config::resolve_config(Some(&next), &env);
+        assert!(!marv_session::config::needs_setup(Some(&next), &config), "no second setup in the chat's terminal");
+
+        // A file with other settings but no provider keeps them.
+        let file = FileConfig { small_model: Some("a/b".into()), ..FileConfig::default() };
+        let next = seeded(Some(&file), &openrouter(Some(KEY), "m/n")).unwrap();
+        assert_eq!(next.small_model.as_deref(), Some("a/b"));
+    }
+
+    #[test]
+    fn a_marv_set_up_already_is_never_changed() {
+        let file = FileConfig { provider: Some(ProviderKind::Ollama), model: Some("qwen3".into()), ..FileConfig::default() };
+        assert!(seeded(Some(&file), &openrouter(Some(KEY), "z-ai/glm-5.3-flash")).is_none());
+        // A key of its own (no provider yet) stays its own.
+        let file = FileConfig { api_key: Some("sk-or-v1-theirs".into()), ..FileConfig::default() };
+        assert_eq!(seeded(Some(&file), &openrouter(Some(KEY), "m/n")).unwrap().api_key.as_deref(), Some("sk-or-v1-theirs"));
+    }
+
+    #[test]
+    fn without_the_key_it_needs_marvs_own_setup_asks() {
+        assert!(seeded(None, &openrouter(None, "m/n")).is_none());
+        assert!(seeded(None, &openrouter(Some("  "), "m/n")).is_none());
+        let kimi = DesktopChoice { provider: Some("kimi"), api_key: Some(KEY), model: "kimi-k3", ..DesktopChoice::default() };
+        assert!(seeded(None, &kimi).is_none(), "an OpenRouter key is never sent to another vendor");
+        let ollama = DesktopChoice { provider: Some("ollama"), model: "qwen3", ..DesktopChoice::default() };
+        assert_eq!(seeded(None, &ollama).unwrap().provider, Some(ProviderKind::Ollama));
+        assert!(seeded(None, &DesktopChoice { provider: Some("someday"), ..DesktopChoice::default() }).is_none());
+    }
+
+    #[test]
+    fn seeded_once_in_a_folder_of_its_own() {
+        let dir = std::env::temp_dir().join(format!(
+            "marv-config-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let choice = openrouter(Some(KEY), "z-ai/glm-5.3-flash");
+        assert_eq!(seed(&dir, &choice), Ok(true));
+        assert_eq!(seed(&dir, &choice), Ok(false), "the second start finds it set up");
+        let file = ConfigStore::new(&dir).load().unwrap().unwrap();
+        assert_eq!(file.api_key.as_deref(), Some(KEY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_patch_changes_only_what_it_names() {

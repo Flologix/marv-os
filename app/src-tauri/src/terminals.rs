@@ -409,6 +409,15 @@ impl Terminals {
         self.terms.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
 
+    /// Ends the agent terminals of chats `ids` that run, each with its whole session as [`close_key`] does: a stopped
+    /// team's members. Pausing alone left their agents and what those started running (seen 2026-11-17). The chats
+    /// whose terminal ran.
+    pub fn close_chats(&self, ids: &[String]) -> Vec<String> {
+        let mut terms = self.terms.lock().unwrap_or_else(|e| e.into_inner());
+        terms.retain(|_, t| t.child.try_wait().ok().flatten().is_none());
+        ids.iter().filter(|id| terms.remove(&format!("chat:{id}")).is_some()).cloned().collect()
+    }
+
     /// The app quits: every terminal ends now, with its whole session ([`Term`]'s drop), and this waits (up to 2 s in
     /// all) for the agents to be gone. Managed state isn't dropped at process exit, so without this a dev server an
     /// agent started kept running after Marv OS closed.
@@ -955,6 +964,54 @@ mod tests {
             }
             assert!(!alive(child), "the nohup child was killed (quit: {quit})");
         }
+    }
+
+    /// "Stop team" ends its members' agents with their whole sessions (a `nohup`'d child too), and only theirs: another
+    /// chat's agent runs on, and a member with no terminal running isn't counted.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_teams_chats_ends_their_whole_sessions_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminals = Terminals::default();
+        let start = |key: &str, pids: &std::path::Path| {
+            let script = format!("nohup sh -c 'echo $$ > {0}; exec sleep 300' >/dev/null 2>&1 & exec sleep 300", pids.display());
+            let launch = Launch {
+                argv: vec!["sh".into(), "-c".into(), script.into()],
+                path: None,
+                withheld: Vec::new(),
+                cwd: dir.path().into(),
+                keep: None,
+                env: Vec::new(),
+            };
+            let term = spawn(1, launch, 80, 24, Arc::new(Mutex::new(None)), None, None).unwrap();
+            terminals.terms.lock().unwrap().insert(key.into(), term);
+        };
+        let (member, other) = (dir.path().join("member"), dir.path().join("other"));
+        start("chat:a", &member);
+        start("chat:b", &other);
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<i32>().ok());
+        let started = Instant::now();
+        while (read(&member).is_none() || read(&other).is_none()) && started.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (child, others) = (read(&member).expect("its nohup child started"), read(&other).expect("the other started"));
+        let alive = |pid: i32| {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+        };
+        assert_eq!(terminals.close_chats(&["a".into(), "gone".into()]), vec!["a".to_string()]);
+        let waited = Instant::now();
+        while alive(child) && waited.elapsed().as_millis() < 2500 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let killed = !alive(child);
+        if !killed {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), nix::sys::signal::Signal::SIGKILL);
+        }
+        assert!(killed, "the member's nohup child was killed");
+        assert!(!terminals.running("chat:a"));
+        assert!(terminals.running("chat:b") && alive(others), "another chat's agent runs on");
+        terminals.close_all();
     }
 
     /// A terminal started with no view (a team's member, mail's) runs, and keeps what it drew, at most [`HISTORY`], for

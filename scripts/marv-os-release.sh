@@ -288,9 +288,9 @@ is asked first. Git for Windows is needed for the Git tab, turns and worktrees (
 
 Check the downloads first: \`sha256sum -c SHA256SUMS --ignore-missing\`.
 
-You'll need a model: Marv's Pro + models plan (models included, no key), your own OpenRouter key, a ChatGPT Plus or Pro
-account, a Kimi Code membership, or Ollama running locally with a model that supports tool calling. Coding agents you
-already use (Claude Code, Codex, OpenCode) run on their own logins. The first run walks you through it.
+Coding agents you already use (Claude Code, Codex, OpenCode and the others) run on their own logins. Marv itself needs a
+model: your own OpenRouter key, a ChatGPT Plus or Pro account, a Kimi Code membership, or Ollama running locally with a
+model that supports tool calling. The first run walks you through it.
 
 ## Known limits
 

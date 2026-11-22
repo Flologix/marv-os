@@ -25,6 +25,7 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
     throw e;
   });
 }
+import { rememberAgentNames } from "./harness";
 import type { PlanStatus } from "./plan";
 
 export const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -667,6 +668,12 @@ export interface Connection {
   close(): void;
 }
 
+/** A list of agents, its names remembered first (`rememberAgentNames`). */
+function named<A extends { id: string; name: string }>(agents: A[]): A[] {
+  rememberAgentNames(agents);
+  return agents;
+}
+
 export const desktop = {
   info: () => invoke<AppInfo>("app_info"),
   setRoot: (path: string) => invoke<AppInfo>("set_root", { path }),
@@ -715,10 +722,11 @@ export const desktop = {
   /** The harnesses found here (Settings → Harnesses): version, login, chats loaded and asleep. */
   harnesses: () => invoke<HarnessInfo[]>("harnesses"),
   /** Every coding agent a chat's terminal can run (Marv, Claude Code, Codex, OpenCode…), installed or not. */
-  terminalAgents: () => invoke<TerminalAgent[]>("terminal_agents"),
-  ownAgents: () => invoke<OwnAgent[]>("own_agents"),
-  addOwnAgent: (name: string, command: string, resume: string) => invoke<OwnAgent[]>("add_own_agent", { name, command, resume }),
-  removeOwnAgent: (id: string) => invoke<OwnAgent[]>("remove_own_agent", { id }),
+  // Each list's names are remembered for `harnessTitle`: a chat run by your own agent shows its name, not its id.
+  terminalAgents: () => invoke<TerminalAgent[]>("terminal_agents").then(named),
+  ownAgents: () => invoke<OwnAgent[]>("own_agents").then(named),
+  addOwnAgent: (name: string, command: string, resume: string) => invoke<OwnAgent[]>("add_own_agent", { name, command, resume }).then(named),
+  removeOwnAgent: (id: string) => invoke<OwnAgent[]>("remove_own_agent", { id }).then(named),
   /** Windows without `git` on the PATH: checkpoints, turns, worktrees and the Git tab need it. */
   gitMissing: () => invoke<boolean>("git_missing"),
   /** Installs an agent's winget package (or `Git.Git`) and says what winget said; only those Marv OS offers. */

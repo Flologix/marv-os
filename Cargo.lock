@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "marv-agent"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3005,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "marv-appcontainer"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "marv-cli"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "marv-core"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "marv-desktop"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "marv-fs"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "futures",
  "getrandom 0.3.4",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "marv-guards"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "marv-kernel"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "marv-mcp"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "marv-mesh"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "marv-oracle"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "marv-core",
@@ -3209,7 +3209,7 @@ dependencies = [
 
 [[package]]
 name = "marv-provider"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "marv-sandbox"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "marv-appcontainer",
  "marv-core",
@@ -3245,7 +3245,7 @@ dependencies = [
 
 [[package]]
 name = "marv-session"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3279,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "marv-tools"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "brotli 8.0.4",
@@ -3317,7 +3317,7 @@ dependencies = [
 
 [[package]]
 name = "marv-tui"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "marv-web"
-version = "0.16.3"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "async-trait",

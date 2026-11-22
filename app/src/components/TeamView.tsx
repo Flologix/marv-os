@@ -120,7 +120,7 @@ export function TeamView({
 
   async function stop() {
     if (rule === undefined) return;
-    if (!(await ask(`Stop every chat team ${team.name}'s rule covers (every chat under this folder, not only the team's)? Their turns stop, and they stay paused until you resume.`, { title: "Marv", kind: "warning" }))) return;
+    if (!(await ask(`Stop every chat team ${team.name}'s rule covers (every chat under this folder, not only the team's)? Their turns stop, their agents end with everything they started, and they stay paused until you resume.`, { title: "Marv", kind: "warning" }))) return;
     await guard(async () => `${await desktop.stopTeam(rule)} stopped.`);
   }
 

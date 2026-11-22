@@ -5,7 +5,7 @@ import { harnessTitle } from "../lib/harness";
 import { type AgentRow, type AppInfo, type ChatRecord, type Entry, type LiveChat, desktop } from "../lib/backend";
 import { forget } from "../lib/chat";
 import { forgetTerm } from "./TermView";
-import { HOME_FOLDER, chatTone, groupChats, isHomeChat, relUnder } from "../lib/places";
+import { HOME_FOLDER, chatTone, goneFolderChats, groupChats, isHomeChat, relUnder } from "../lib/places";
 import { splitByTeam, teamHeader } from "../lib/teams";
 import { Icon } from "./icons";
 import { SpaceMenu } from "./SpacesBar";
@@ -270,8 +270,8 @@ export function Sidebar({
     return { count: list.length, tone };
   }
 
-  /** One chat's row (a team member's with its role badge). */
-  function chatRow(chat: ChatRecord, rel: string, inTeam: boolean) {
+  /** One chat's row (a team member's with its role badge; `gone`: its folder is gone, shown in a folder above it). */
+  function chatRow(chat: ChatRecord, rel: string, inTeam: boolean, gone = false) {
     const state = states.get(chat.id);
     const { tone, word } = chatTone(state);
     return (
@@ -303,6 +303,11 @@ export function Sidebar({
           />
         ) : (
           <span className="nav-name">{inTeam && chat.role && (!chat.title || chat.title.endsWith(`-${chat.role}`)) ? chat.role : chat.title}</span>
+        )}
+        {gone && (
+          <span className="nav-badge" title={`Its folder ${chat.folder} is gone: delete the chat, or put the folder back`}>
+            folder gone
+          </span>
         )}
         {chat.harness && (
           <span className="nav-badge agent" title={`Run by your own ${harnessTitle(chat.harness)}`}>
@@ -374,6 +379,7 @@ export function Sidebar({
       );
     }
     out.push(...split.rest.map((chat) => chatRow(chat, rel, false)));
+    out.push(...goneFolderChats(groups, rel, children[rel]).map((chat) => chatRow(chat, rel, false, true)));
     for (const g of guests.filter((g) => guestRel(g) === rel)) {
       out.push(
         <div key={`guest:${g.name}:${g.pid}`} className="nav-row chat guest" title={`A terminal Marv here (pid ${g.pid}): its approvals are its own. Click for Activity.`} onClick={onGuest}>

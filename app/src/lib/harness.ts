@@ -11,10 +11,19 @@ export const HARNESS_TITLES: Record<string, string> = {
   antigravity: "Antigravity",
 };
 
+/** The names of the agents `terminal_agents` lists, by id: your own (Settings > Agents, `own-…`) and the known ones
+ * the table above lacks. Without them a chat list, team card or Activity row showed "own-hello" for "Hello". */
+const listed = new Map<string, string>();
+
+/** Agents' names as a list of them came back (`terminal_agents`, `own_agents`): [`harnessTitle`] shows them from now on. */
+export function rememberAgentNames(agents: { id: string; name: string }[]): void {
+  for (const a of agents) if (a.name) listed.set(a.id, a.name);
+}
+
 /** What the page calls the agent that runs a chat ("Marv" for none). */
 export function harnessTitle(id: string | null | undefined): string {
   if (!id) return "Marv";
-  return HARNESS_TITLES[id] ?? id;
+  return HARNESS_TITLES[id] ?? listed.get(id) ?? id;
 }
 
 /** How to get an agent that isn't installed yet. */

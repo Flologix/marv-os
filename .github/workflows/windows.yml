@@ -66,6 +66,11 @@ jobs:
           mkdir -p app/src-tauri/binaries
           cp target/release/marv.exe app/src-tauri/binaries/marv.exe
           target/release/marv.exe --version
+          # The runner has the Visual C++ runtime, so --version passing proves nothing for a clean Windows: marv.exe
+          # must not import it (.cargo/config.toml, +crt-static).
+          if grep -aqi 'vcruntime140' target/release/marv.exe; then
+            echo "marv.exe imports VCRUNTIME140.dll: it won't start on a Windows without the VC++ redistributable"; exit 1
+          fi
       # The Git tab runs lazygit: the installer brings its own (MIT), next to marv-desktop.exe, for people who haven't
       # installed it. Pinned and checked: a new version is a change here, its hash from the release's checksums.txt.
       - name: Fetch lazygit
@@ -107,6 +112,9 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npx tauri build --bundles nsis --config "{\"version\":\"$VERSION\"}"
+          if grep -aqi 'vcruntime140' ../target/release/marv-desktop.exe; then
+            echo "marv-desktop.exe imports VCRUNTIME140.dll: it won't start on a Windows without the VC++ redistributable"; exit 1
+          fi
       - name: Smoke test
         shell: pwsh
         run: packaging/desktop/smoke-windows.ps1 target/release/marv-desktop.exe

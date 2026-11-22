@@ -1,0 +1,11 @@
+# Windows: link the C runtime into every binary (`+crt-static`). Without it marv.exe imported VCRUNTIME140.dll, which
+# a clean Windows doesn't have (it comes with the Visual C++ Redistributable): on a fresh Windows 11 every Marv chat
+# exited at once (0xC0000135, DLL not found) while marv-desktop.exe opened, because tauri-build links the runtime
+# statically for the desktop only. Machines with Visual Studio or another app's redistributable hid it. tauri-build
+# sees crt-static and skips its own static-runtime linking, so the desktop is unchanged.
+# A RUSTFLAGS environment variable replaces these flags: windows.yml checks the built .exe files instead of trusting this.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

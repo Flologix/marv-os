@@ -128,6 +128,20 @@ export function groupChats<C extends ChatRecord>(chats: C[], root: string, rootN
     .sort((a, b) => (a.rel === "" ? -1 : b.rel === "" ? 1 : a.rel.localeCompare(b.rel)));
 }
 
+/**
+ * The chats under folder `rel` whose own folder is gone (renamed or removed away): the next folder down their path
+ * isn't in `rel`'s listing `entries` (`undefined`: not listed yet, so nothing is known gone). The tree lists only
+ * folders that exist, so these had no row and no Delete anywhere (seen 2026-11-17); they show inside `rel` instead.
+ */
+export function goneFolderChats<C extends ChatRecord>(groups: ChatGroup<C>[], rel: string, entries: { name: string; dir: boolean }[] | undefined): C[] {
+  if (entries === undefined) return [];
+  const here = new Set(entries.filter((e) => e.dir).map((e) => e.name));
+  return groups
+    .filter((g) => g.rel !== rel && (rel === "" || g.rel.startsWith(`${rel}/`)))
+    .filter((g) => !here.has(g.rel.slice(rel === "" ? 0 : rel.length + 1).split("/")[0]))
+    .flatMap((g) => g.chats);
+}
+
 /** Something on Home's "Needs you" list: Open goes to the chat, or to a place. */
 export interface Need {
   key: string;

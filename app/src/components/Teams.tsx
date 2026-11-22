@@ -136,7 +136,7 @@ export function Teams({
   }
 
   async function stopTeam(r: MeshRule) {
-    if (!(await ask(`Stop every chat "${ruleName(r)}" covers? Their turns stop, and they stay paused until you resume each one.`, { title: "Marv", kind: "warning" })))
+    if (!(await ask(`Stop every chat "${ruleName(r)}" covers? Their turns stop, their agents end with everything they started, and they stay paused until you resume each one.`, { title: "Marv", kind: "warning" })))
       return;
     await guard(async () => setNotice(`${await desktop.stopTeam(r.id)} stopped.`));
   }
