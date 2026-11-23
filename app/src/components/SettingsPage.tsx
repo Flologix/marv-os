@@ -103,6 +103,7 @@ export function SettingsPage({
   const [reports, setReports] = useState<HangReports | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [kernel, setKernel] = useState<string | null>(null);
+  const [updateCheck, setUpdateCheck] = useState(true);
   const [agents, setAgents] = useState<TerminalAgent[]>([]);
   const [picker, setPicker] = useState<{ tab?: "openrouter" | "plan" | "ollama"; n: number } | null>(null);
   const [active, setActive] = useState<SectionId>("plan");
@@ -111,6 +112,7 @@ export function SettingsPage({
   useEffect(() => {
     desktop.hangReports().then(setReports, () => setReports(null));
     desktop.appVersion().then(setVersion, () => setVersion(null));
+    desktop.updateCheckOn().then(setUpdateCheck, () => {});
     desktop.about().then((a) => setKernel(a.version), () => setKernel(null));
     desktop.terminalAgents().then(setAgents, () => setAgents([]));
   }, []);
@@ -383,6 +385,20 @@ export function SettingsPage({
             <dt>Computer</dt>
             <dd>{computerName()}</dd>
           </dl>
+          <div className="switch">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={updateCheck}
+              aria-labelledby="update-check"
+              className={`toggle${updateCheck ? " on" : ""}`}
+              onClick={() => guard("about", () => desktop.setUpdateCheck(!updateCheck).then(() => setUpdateCheck(!updateCheck)))}
+            />
+            <div>
+              <div id="update-check">Tell me when a new version is out</div>
+              <div className="muted small">Once a day Marv OS asks GitHub for the latest release. Nothing else is sent.</div>
+            </div>
+          </div>
           <div className="about-actions">
             <button className="btn" onClick={() => onSetup("first")}>
               Run the setup again

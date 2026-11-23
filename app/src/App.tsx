@@ -21,6 +21,7 @@ import {
   type ChatSettings,
   type LiveChat,
   type Model,
+  type UpdateInfo,
   type UsageView,
   desktop,
   isDesktop,
@@ -164,6 +165,20 @@ function Desktop() {
       (text) => text && void say(text, { title: "Marv" }),
       () => {},
     );
+  }, []);
+
+  // A newer release (`update.rs`): a bar with its notes and the download page, until dismissed for that version. Asked
+  // at launch and every few hours (the backend asks GitHub at most once a day).
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  useEffect(() => {
+    const check = () =>
+      desktop.updateAvailable().then(
+        (u) => setUpdate(u && u.version !== stored<string | null>("marv-update-dismissed", null) ? u : null),
+        () => {},
+      );
+    void check();
+    const timer = setInterval(check, 6 * 60 * 60 * 1000);
+    return () => clearInterval(timer);
   }, []);
 
   // Opened as `marv-desktop <dir>`: that folder; else where the last session left off.
@@ -624,6 +639,22 @@ function Desktop() {
             </button>
           )}
           <button className="icon-btn" title="Dismiss" onClick={() => setGitMissing(false)}>
+            ×
+          </button>
+        </div>
+      )}
+      {update && (
+        <div className="act-away" role="status">
+          <span>
+            <b>Marv OS {update.version} is out.</b>
+          </span>
+          <button className="btn" onClick={() => void desktop.openUrl(update.notesUrl)}>
+            What's new
+          </button>
+          <button className="btn" onClick={() => void desktop.openUrl(update.downloadUrl)}>
+            Download
+          </button>
+          <button className="icon-btn" title="Dismiss" onClick={() => (keep("marv-update-dismissed", update.version), setUpdate(null))}>
             ×
           </button>
         </div>

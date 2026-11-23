@@ -43,6 +43,10 @@ pub struct Settings {
     /// The first run's "Sign in to Marv" step was answered (signed in or skipped): it doesn't show again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub account_asked: bool,
+    /// The update notice (`update.rs`). None: on (the default); `false` only when the person turned it off in
+    /// Settings › About.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

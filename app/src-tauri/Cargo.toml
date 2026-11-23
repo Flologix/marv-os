@@ -60,6 +60,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 regex = "1.11"
 toml = "0.8"
 unicode-width = "0.2"
+# The update notice compares this build's version with the latest release's (already in the lockfile, from Tauri).
+semver = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Kernel #41: the web view's web-process-terminated signal (the same webkit2gtk Tauri uses).

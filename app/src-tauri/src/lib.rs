@@ -26,6 +26,7 @@ mod terminal_events;
 mod terminals;
 mod tree;
 mod triage;
+mod update;
 mod watchdog;
 mod worktrees;
 
@@ -4978,6 +4979,9 @@ pub fn run() {
             add_timer,
             remove_timer,
             watchdog_notice,
+            update_available,
+            update_check_on,
+            set_update_check,
             hang_reports,
             open_hang_reports,
         ])
@@ -5270,6 +5274,31 @@ fn watch_web_process(app: &tauri::App) {
     if let Err(e) = hooked {
         applog::warn("watchdog", &format!("can't watch the web process ({e}): a silent page is only reported"));
     }
+}
+
+/// The update notice (`update.rs`): the latest release when it's newer than this build, checked at most once a day.
+/// `None` when it isn't, the check is off or GitHub can't be reached.
+#[tauri::command]
+async fn update_available(app: AppHandle, desktop: State<'_, Desktop>) -> Result<Option<update::Update>, ()> {
+    let on = desktop.store.settings().update_check != Some(false);
+    if !update::enabled(on, |k| std::env::var(k).ok(), cfg!(debug_assertions)) {
+        return Ok(None);
+    }
+    let current = app.package_info().version.to_string();
+    let now = now_ms() / 1000;
+    let latest = update::latest(desktop.store.data_dir(), update::LATEST_URL, &current, now).await;
+    Ok(latest.and_then(|latest| update::newer(&current, &latest)))
+}
+
+/// Settings › About: whether Marv OS checks for a newer release.
+#[tauri::command]
+fn update_check_on(desktop: State<'_, Desktop>) -> bool {
+    desktop.store.settings().update_check != Some(false)
+}
+
+#[tauri::command]
+fn set_update_check(desktop: State<'_, Desktop>, on: bool) -> Result<(), String> {
+    desktop.store.modify_settings(|settings| settings.update_check = if on { None } else { Some(false) })
 }
 
 /// Kernel #41: what this launch did at start, for the page once (it closed an earlier window that stopped responding).

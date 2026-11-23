@@ -30,6 +30,13 @@ import type { PlanStatus } from "./plan";
 
 export const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/** A newer Marv OS release than this build (`update.rs`). */
+export interface UpdateInfo {
+  version: string;
+  notesUrl: string;
+  downloadUrl: string;
+}
+
 export interface Space {
   id: string;
   name: string;
@@ -800,6 +807,11 @@ export const desktop = {
   about: () => invoke<AboutMarv>("about_marv"),
   /** Kernel #41: what this launch did at start, once ("an earlier Marv window stopped responding; it was closed"). */
   watchdogNotice: () => invoke<string | null>("watchdog_notice"),
+  /** The latest release when it's newer than this build: checked at most once a day, none when off or offline. */
+  updateAvailable: () => invoke<UpdateInfo | null>("update_available"),
+  /** Settings › About: whether Marv OS checks for a newer release. */
+  updateCheckOn: () => invoke<boolean>("update_check_on"),
+  setUpdateCheck: (on: boolean) => invoke<void>("set_update_check", { on }),
   /** Kernel #41: how many hang reports there are, and where. */
   hangReports: () => invoke<HangReports>("hang_reports"),
   /** Kernel #41: the reports' folder in the file manager. */
