@@ -1715,11 +1715,20 @@ fn clipboard_write(app: tauri::AppHandle, text: String) -> Result<(), String> {
 }
 
 /// The system clipboard's text, for ctrl+shift+v in a terminal: the person's own paste, never an agent's request.
+/// Off the main thread: text copied in this window is on the web view's clipboard, which answers a read from the main
+/// thread, so reading there waited on itself and the whole window hung (Wayland, where the read has no timeout).
 #[tauri::command]
-fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
+async fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
-    app.clipboard().read_text().map_err(|e| e.to_string())
+    let read = tokio::task::spawn_blocking(move || app.clipboard().read_text().map_err(|e| e.to_string()));
+    match tokio::time::timeout(CLIPBOARD_WAIT, read).await {
+        Ok(text) => text.map_err(|e| e.to_string())?,
+        Err(_) => Err("The clipboard didn't answer.".into()),
+    }
 }
+
+/// How long a paste waits for the program holding the clipboard to hand its text over.
+const CLIPBOARD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether the clipboard holds a picture, for a terminal's paste that found no text (a screenshot): the page then
 /// sends Claude Code its own key for pasting one. Only whether: the picture itself never passes through here.
