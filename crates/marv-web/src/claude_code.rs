@@ -678,8 +678,9 @@ pub const GUEST_MCP_CONFIG: &str = "/run/marv-harness/mcp.json";
 /// The person's own MCP servers (Settings › Apps, `~/.marv/mcp.json`) as Claude Code's `mcpServers` entries, so its
 /// chats reach what Marv's do (Linear, Notion): they had only the mesh, and the sandbox hides Marv's config. The
 /// folder's own servers are left to Claude Code (it reads `.mcp.json` and asks). Those switched off for the chat are
-/// left out, and so is one named as the mesh. An app Marv signed in to with OAuth is passed as its address: Claude
-/// Code signs in on its own (`/mcp`) and keeps its tokens; Marv's tokens and a client secret are never handed over.
+/// left out, and so is one named as the mesh. An app Marv signed in to with OAuth is passed as its address, client
+/// and scope: Claude Code signs in on its own (`/mcp`) and keeps its tokens. Marv's tokens are never handed over; a
+/// client secret goes to Claude Code's own secret store ([`share_client_secrets`]), never into this file.
 pub fn person_servers(spec: &ChatSpec) -> serde_json::Map<String, Value> {
     use marv_mcp::config::{Include, McpTransport, load_mcp_config};
     let mut servers = serde_json::Map::new();
@@ -701,7 +702,7 @@ pub fn person_servers(spec: &ChatSpec) -> serde_json::Map<String, Value> {
                     entry["headers"] = json!(headers);
                 }
                 if let Some(o) = oauth.filter(|o| o.client_id.is_some() || o.callback_port.is_some()) {
-                    entry["oauth"] = json!({"clientId": o.client_id, "callbackPort": o.callback_port});
+                    entry["oauth"] = json!({"clientId": o.client_id, "callbackPort": o.callback_port, "scopes": o.scope});
                     if let Some(map) = entry["oauth"].as_object_mut() {
                         map.retain(|_, v| !v.is_null());
                     }
@@ -712,6 +713,91 @@ pub fn person_servers(spec: &ChatSpec) -> serde_json::Map<String, Value> {
         servers.insert(server.name, entry);
     }
     servers
+}
+
+/// The client secrets of the person's apps that sign in with one (Google's clients need theirs), stored where Claude
+/// Code looks for them: its own secret store (the keychain on macOS, its credentials file elsewhere), filled by its own
+/// `claude mcp add-json --client-secret`, keyed by the app's name and address. Without it a Claude Code chat's `/mcp`
+/// said "client_secret is missing" for Gmail. The entry that command also adds is a local one for Marv's own folder
+/// (`claude-code-secrets` in Marv's config folder), so no project of the person's sees it. Run again only when an app's
+/// name, address, client or secret changes (a fingerprint per app in that folder); a failure is logged, and the chat
+/// starts anyway.
+pub fn share_client_secrets(bin: &std::path::Path, spec: &ChatSpec) {
+    use marv_mcp::config::{Include, McpTransport, load_mcp_config};
+    use sha2::{Digest, Sha256};
+    if !spec.sources.contains(&marv_session::sources::Source::User) {
+        return;
+    }
+    let env: marv_mcp::Env = marv_core::process::vars().into_iter().collect();
+    let include = Include { personal: true, project: false };
+    let dir = spec.config_dir.join("claude-code-secrets");
+    let shared_file = dir.join("shared.json");
+    let mut shared: serde_json::Map<String, Value> =
+        std::fs::read_to_string(&shared_file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let before = shared.clone();
+    for server in load_mcp_config(&spec.root, &spec.config_dir, &env, include).servers {
+        // Claude Code keys the secret by name, address and headers; its `add-json` stores it without headers.
+        let McpTransport::Http { url, headers, oauth: Some(o) } = server.transport else { continue };
+        let (Some(id), Some(secret)) = (o.client_id.as_deref(), o.client_secret.as_deref()) else { continue };
+        if !headers.is_empty() {
+            continue;
+        }
+        let print = format!("{:x}", Sha256::digest(format!("{}\n{url}\n{id}\n{secret}", server.name)));
+        if shared.get(&server.name).and_then(Value::as_str) == Some(print.as_str()) {
+            continue;
+        }
+        let entry = json!({"type": "http", "url": url, "oauth": {"clientId": id}});
+        match add_client_secret(bin, &dir, &server.name, &entry, secret) {
+            Ok(()) => {
+                shared.insert(server.name.clone(), print.into());
+            }
+            Err(why) => {
+                eprintln!("Claude Code didn't take {}'s client secret: {why}", server.name);
+            }
+        }
+    }
+    if shared != before && std::fs::create_dir_all(&dir).is_ok() {
+        let _ = write_private(&shared_file, &Value::Object(shared));
+    }
+}
+
+/// `claude mcp add-json --scope local --client-secret <name> <entry>` in `dir`, the secret in `MCP_CLIENT_SECRET` (not
+/// an argument: arguments show in `ps`). At most 30 s.
+fn add_client_secret(
+    bin: &std::path::Path,
+    dir: &std::path::Path,
+    name: &str,
+    entry: &Value,
+    secret: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut child = marv_core::process::command(bin)
+        .args(["mcp", "add-json", "--scope", "local", "--client-secret", name, &entry.to_string()])
+        .env("MCP_CLIENT_SECRET", secret)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => {
+                let mut err = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut err);
+                }
+                return Err(format!("{status}: {}", printable(err.trim())));
+            }
+            None if started.elapsed() > std::time::Duration::from_secs(30) => {
+                let _ = child.kill();
+                return Err("it took over 30 s".into());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
 }
 
 /// A file removed when this goes (a headless run's `--mcp-config`, which holds the person's app settings).
@@ -834,6 +920,7 @@ pub fn terminal_command_with(
         args.extend(["--model".into(), model.into()]);
     }
     // The person's apps beside the mesh, in a file of the chat's own next to its events file.
+    share_client_secrets(&bin, spec);
     let apps = person_servers(spec);
     let config_file = (!apps.is_empty()).then(|| events.with_extension("mcp.json"));
     if let Some(file) = &config_file {
@@ -1011,6 +1098,7 @@ pub async fn run_chat_with(
     let (mut launch, mesh_paths) = launch(&bin, &spec, server.as_ref(), &out);
     // The person's apps beside the mesh, as its terminal has them (a timer's wake ran with the mesh only): in a file of
     // this run's own, removed when it ends.
+    share_client_secrets(&bin, &spec);
     let apps = person_servers(&spec);
     let config_file = (!apps.is_empty())
         .then(|| spec.config_dir.join("terminals").join(format!("headless-{}.mcp.json", uuid::Uuid::new_v4().simple())))
@@ -1302,6 +1390,53 @@ mod tests {
         assert!(args.contains(&GUEST_MCP_CONFIG.to_string()));
         // Without the person's own sources (marv-web), none.
         assert!(person_servers(&ChatSpec { sources: Vec::new(), ..spec }).is_empty());
+    }
+
+    /// **An app's client secret reaches Claude Code's own store.** Gmail's Google client needs its secret, which the
+    /// `--mcp-config` file never holds: `claude mcp add-json --client-secret` stores it, the secret in the environment
+    /// (never an argument), run in Marv's own folder, and only again once the client changes.
+    #[cfg(unix)]
+    #[test]
+    fn an_apps_client_secret_goes_to_claude_codes_own_store_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, root) = (tmp.path().join("conf"), tmp.path().join("project"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let log = tmp.path().join("calls");
+        let bin = tmp.path().join("claude");
+        std::fs::write(&bin, format!("#!/bin/sh\necho \"$PWD|$*|$MCP_CLIENT_SECRET\" >> '{}'\n", log.display())).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let write_apps = |secret: &str| {
+            let apps = json!({"mcpServers": {
+                "gmail": {"type": "http", "url": "https://gmail.example/mcp",
+                          "oauth": {"clientId": "c", "clientSecret": secret, "scope": "mail.read"}},
+                "linear": {"type": "http", "url": "https://mcp.linear.app/mcp"},
+            }});
+            std::fs::write(config.join("mcp.json"), apps.to_string()).unwrap();
+        };
+        write_apps("s3cret");
+        let spec = ChatSpec {
+            root,
+            config_dir: config.clone(),
+            sources: vec![marv_session::sources::Source::User],
+            ..crate::host::tests::spec()
+        };
+        share_client_secrets(&bin, &spec);
+        share_client_secrets(&bin, &spec);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 1, "once, and only for the app with a secret: {calls}");
+        let parts: Vec<&str> = lines[0].split('|').collect();
+        assert!(parts[0].ends_with("claude-code-secrets"));
+        assert!(parts[1].starts_with("mcp add-json --scope local --client-secret gmail "));
+        assert!(!parts[1].contains("s3cret"), "never an argument");
+        assert_eq!(parts[2], "s3cret");
+        // A new secret: stored again.
+        write_apps("n3w");
+        share_client_secrets(&bin, &spec);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().last().unwrap().rsplit('|').next(), Some("n3w"));
+        // The chat's entry names the client and its scope, not the secret.
+        assert_eq!(person_servers(&spec)["gmail"]["oauth"], json!({"clientId": "c", "scopes": "mail.read"}));
     }
 
     /// **H4: a harness chat's yolo is Marv's yolo.** Asked for inside the outer sandbox: edits and commands run unasked

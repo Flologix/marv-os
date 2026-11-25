@@ -303,6 +303,15 @@ impl Client {
         oauth::auth(&mut provider, &w.url, None, Some(code)).await.map(|_| ())
     }
 
+    /// A login on a server that connected without asking for one: some list their tools signed out and ask only
+    /// when one is called (Gmail). The authorization redirect, or a refresh where a refresh token is stored.
+    pub async fn start_auth(&self) -> crate::Result<()> {
+        let Wire::Http(w) = &self.inner.wire else { return Err(McpError::Server("only remote servers log in".into())) };
+        let Some(auth) = &w.auth else { return Err(McpError::Server("no login is in progress".into())) };
+        let mut provider = auth.lock().await;
+        oauth::auth(&mut provider, &w.url, None, None).await.map(|_| ())
+    }
+
     /// Cancelled once the connection is gone (the server exited, or [`Client::close`]).
     pub fn closed(&self) -> CancellationToken {
         self.inner.closed.clone()

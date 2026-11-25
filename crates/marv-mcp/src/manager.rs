@@ -787,6 +787,16 @@ impl McpManager {
                         return Err(fail(login_error(&err.to_string())));
                     }
                 }
+                // Connected signed out: a server can list its tools without a login and ask for one only when a
+                // tool is called (Gmail), and the login ended with nothing saved and every call refused. Asked to log
+                // in, a server that offers OAuth (a client in its config, or RFC 9728 metadata) gets the login here.
+                if !redirected.load(std::sync::atomic::Ordering::SeqCst)
+                    && (oauth.is_some() || crate::oauth::discover_resource_metadata(&server_url, None).await.ok().flatten().is_some())
+                    && let Err(err) = client.start_auth().await
+                {
+                    abort.check()?;
+                    return Err(fail(login_error(&err.to_string())));
+                }
                 // Connected without asking for a login: the reconnect below is all there is to do.
                 if redirected.load(std::sync::atomic::Ordering::SeqCst) {
                     let mut outcome = expectation.lock().unwrap_or_else(|e| e.into_inner()).outcome();

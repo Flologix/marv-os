@@ -301,6 +301,8 @@ pub struct OAuthOptions {
     pub pre_registered: Option<(String, Option<String>, String)>,
     /// Answer /mcp without asking for a token.
     pub open: bool,
+    /// Answer /mcp without a token except a tool call (Gmail's server: it lists its tools signed out).
+    pub lists_signed_out: bool,
 }
 
 #[derive(Default)]
@@ -387,7 +389,9 @@ async fn oauth_handle(req: Req, state: &Mutex<OAuthState>, opts: &OAuthOptions, 
     match req.path.as_str() {
         "/mcp" => {
             let auth = req.headers.get("authorization").cloned().unwrap_or_default();
-            let ok = opts.open || auth.strip_prefix("Bearer ").is_some_and(|t| state.lock().unwrap().access.contains(t));
+            let listing = opts.lists_signed_out && !req.body.contains("\"tools/call\"");
+            let ok =
+                opts.open || listing || auth.strip_prefix("Bearer ").is_some_and(|t| state.lock().unwrap().access.contains(t));
             if !ok {
                 return Resp {
                     status: 401,

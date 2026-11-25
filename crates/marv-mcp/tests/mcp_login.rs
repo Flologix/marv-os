@@ -132,6 +132,29 @@ async fn logs_in_through_the_browser_and_stores_client_tokens_and_discovery() {
     assert_eq!(call(&m, "mcp__remote__echo", json!({"text": "hi"})).await.0, "echo: hi");
 }
 
+/// A server that lists its tools signed out and asks for a login only when one is called (Gmail): /mcp login still
+/// opens the browser and saves the tokens, so the calls work. It said "logged in" and saved nothing.
+#[tokio::test]
+async fn a_server_that_lists_its_tools_signed_out_still_logs_in() {
+    let (e, s) = (env(), oauth_server(OAuthOptions { lists_signed_out: true, ..Default::default() }).await);
+    let m = e.manager(vec![remote("remote", &s.url, json!({}))]);
+    m.start().await;
+    let (authorize, slot) = capture();
+    let login = m.login("remote", authorize).unwrap();
+    tokio::spawn(browse(opened(&slot).await));
+    assert_eq!(login.done.await.unwrap().unwrap().state, McpState::Connected);
+    assert!(e.store.get(&e.key(ServerSource::Personal, &s.url)).unwrap().tokens.is_some());
+    assert_eq!(call(&m, "mcp__remote__echo", json!({"text": "hi"})).await.0, "echo: hi");
+
+    // One that needs no login at all connects, with nothing opened.
+    let open = oauth_server(OAuthOptions { open: true, ..Default::default() }).await;
+    let m = e.manager(vec![remote("plain", &open.url, json!({}))]);
+    m.start().await;
+    let (authorize, slot) = capture();
+    assert_eq!(m.login("plain", authorize).unwrap().done.await.unwrap().unwrap().state, McpState::Connected);
+    assert!(slot.lock().unwrap().is_none());
+}
+
 #[tokio::test]
 async fn the_same_through_a_pasted_callback_address_and_a_wrong_state_is_refused() {
     let (e, s) = (env(), oauth_server(OAuthOptions::default()).await);
