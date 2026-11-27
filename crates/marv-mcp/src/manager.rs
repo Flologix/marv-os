@@ -358,6 +358,28 @@ struct ServerCaller {
 #[async_trait::async_trait]
 impl McpCaller for ServerCaller {
     async fn call(&self, tool: &str, args: Map<String, Value>, cancel: CancellationToken) -> crate::Result<McpCallResult> {
+        self.send(tool, args, None, cancel).await
+    }
+
+    async fn call_answering(
+        &self,
+        tool: &str,
+        args: Map<String, Value>,
+        answers: &crate::input::Answers,
+        cancel: CancellationToken,
+    ) -> crate::Result<McpCallResult> {
+        self.send(tool, args, Some(answers), cancel).await
+    }
+}
+
+impl ServerCaller {
+    async fn send(
+        &self,
+        tool: &str,
+        args: Map<String, Value>,
+        answers: Option<&crate::input::Answers>,
+        cancel: CancellationToken,
+    ) -> crate::Result<McpCallResult> {
         let used = {
             let mut state = self.shared.state();
             let Some(c) = state.find(self.id) else {
@@ -368,7 +390,7 @@ impl McpCaller for ServerCaller {
                 _ => c.client.clone().unwrap_or_else(|| self.client.clone()),
             }
         };
-        let err = match used.call_tool(tool, args, self.timeout, cancel).await {
+        let err = match used.call_tool(tool, args, answers, self.timeout, cancel).await {
             Ok(result) => return Ok(result),
             Err(err) => err,
         };

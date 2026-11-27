@@ -63,6 +63,8 @@ export interface ProviderInfo {
   console: { label: string; url: string };
   /** What to register, in one or two sentences. */
   steps: string;
+  /** The whole setup, step by step. */
+  guide?: string;
   /** Fixed, so the redirect URI registered with the provider is known ahead. */
   callbackPort: number;
   /** Its token endpoint wants the client secret too. */
@@ -75,6 +77,7 @@ export const PROVIDERS: Record<Provider, ProviderInfo> = {
     console: { label: "Google Cloud › Credentials", url: "https://console.cloud.google.com/apis/credentials" },
     steps:
       "In a Google Cloud project, enable the Gmail, Calendar and Drive MCP APIs you want, set the OAuth consent screen to Internal (your Workspace only), then Create credentials › OAuth client ID › Desktop app.",
+    guide: "https://github.com/Flologix/marv-os/blob/main/docs/apps/google.md",
     callbackPort: 53682,
     secret: true,
   },

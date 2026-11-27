@@ -83,6 +83,7 @@ export function TermView({
   onState,
   onId,
   scrollback = 0,
+  redrawKeys,
 }: {
   cacheKey: string;
   open: (cols: number, rows: number, onData: (m: TermMessage) => void) => Promise<number>;
@@ -90,6 +91,8 @@ export function TermView({
   onState: (state: TermState) => void;
   onId?: (id: number | null) => void;
   scrollback?: number;
+  /** The keys that make the agent draw its whole screen again (Claude Code's ctrl+L), sent when it shows again. */
+  redrawKeys?: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const calls = useRef({ open, onState, onId });
@@ -99,6 +102,8 @@ export function TermView({
     const el = host.current;
     if (!el) return;
     let k = kept.get(cacheKey);
+    // Kept from before: the chat is showing again.
+    const again = k !== undefined;
     if (!k) {
       const wrap = document.createElement("div");
       wrap.className = "term-wrap";
@@ -148,11 +153,17 @@ export function TermView({
       // GPU's context is lost or can't be had.
       try {
         const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
+        webgl.onContextLoss(() => {
+          webgl.dispose();
+          if (wrap.isConnected && el.clientWidth > 0) fit.fit();
+        });
         term.loadAddon(webgl);
       } catch {
         // The DOM renderer, as before.
       }
+      // Measured again with the renderer that draws it: its cells aren't the DOM renderer's size, and the first fit
+      // used those, so the agent drew in fewer columns and rows than the pane holds (and nothing resized it after).
+      if (el.clientWidth > 0) fit.fit();
       // Copying. An agent's TUI copies with OSC 52 (`ESC ] 52 ; c ; <base64> BEL`): Claude Code said "copied" and the
       // clipboard kept what it had, as xterm leaves the sequence to the app. A request to read the clipboard ("?") is
       // refused: what's on it is the person's, not the agent's.
@@ -215,9 +226,10 @@ export function TermView({
       });
       term.onData((data) => fresh.id !== null && void desktop.gitTerminalWrite(fresh.id, data).catch(() => {}));
     } else {
+      // Not fitted here: the view's size is still settling as the chat comes back, and each size the agent is told
+      // makes it draw its screen again; two widths in a row left both drawings on screen, one over the other. The
+      // resize observer below fits it once the size holds.
       el.appendChild(k.wrap);
-      if (el.clientWidth > 0) k.fit.fit();
-      if (k.id !== null) void desktop.gitTerminalResize(k.id, k.term.cols, k.term.rows).catch(() => {});
       if (freeToFocus()) k.term.focus();
     }
     const shown = k;
@@ -227,11 +239,17 @@ export function TermView({
     // Drawn again from its own buffer when it shows again (back from Activity, another place or chat): hidden, the
     // GPU canvas lost its picture, and xterm only draws again for new output, so an idle agent's terminal stayed
     // black until the agent drew something.
-    const redraw = () => shown.term.refresh(0, shown.term.rows - 1);
+    // The GPU renderer's glyphs are dropped too: hidden, they could come back as gaps in words ("protec i n").
+    const redraw = () => {
+      shown.term.clearTextureAtlas();
+      shown.term.refresh(0, shown.term.rows - 1);
+    };
     redraw();
     // The view's size: `fit` changes the terminal's, and `onResize` tells the agent. A size from nothing is the view
     // showing again.
     let wasHidden = el.clientWidth === 0;
+    // The first fit of this showing (the observer reports the size it starts with).
+    let fitted = false;
     // Fitted once the size settles: dragging a pane edge fires it per frame, and each fit reflows the whole buffer.
     let fitTimer: ReturnType<typeof setTimeout> | undefined;
     const resized = new ResizeObserver(() => {
@@ -243,7 +261,14 @@ export function TermView({
       fitTimer = setTimeout(() => {
         if (el.clientWidth === 0 || !shown.wrap.isConnected) return;
         shown.fit.fit();
-        if (back) redraw();
+        if (back || !fitted) redraw();
+        // Showing again, the agent is asked to draw its screen afresh, after it has drawn for the new size: Claude
+        // Code redraws on each resize and its drawings could still overlap (ctrl+L by hand put them right).
+        if (redrawKeys && ((back && fitted) || (again && !fitted))) {
+          const id = shown.id;
+          setTimeout(() => id !== null && void desktop.gitTerminalWrite(id, redrawKeys).catch(() => {}), 150);
+        }
+        fitted = true;
       }, 80);
     });
     // Back to the window (from another app): the keys go to the terminal it shows, not to whatever had focus.
@@ -258,7 +283,7 @@ export function TermView({
       // Kept: out of this view, still running and receiving.
       if (shown.wrap.parentElement === el) el.removeChild(shown.wrap);
     };
-  }, [cacheKey, run, scrollback]);
+  }, [cacheKey, run, scrollback, redrawKeys]);
 
   return <div className="git-term" ref={host} />;
 }

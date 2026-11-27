@@ -225,6 +225,14 @@ function OAuthPanel({
             <button className="link" onClick={() => void desktop.openUrl(provider!.console.url)}>
               {provider!.console.label} ↗
             </button>
+            {provider!.guide && (
+              <>
+                {" · "}
+                <button className="link" onClick={() => void desktop.openUrl(provider!.guide!)}>
+                  Setup guide ↗
+                </button>
+              </>
+            )}
           </p>
           <div className="field">
             <span>Redirect URI</span>

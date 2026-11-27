@@ -24,6 +24,7 @@
 pub mod client;
 pub mod config;
 pub mod deferred;
+pub mod input;
 pub mod install;
 pub mod jsonrpc;
 pub mod manager;

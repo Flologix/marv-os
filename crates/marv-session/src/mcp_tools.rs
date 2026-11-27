@@ -15,14 +15,18 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use marv_core::printable::printable;
 use marv_core::{Provenance, ToolCall, ToolKind};
 use marv_mcp::deferred::{SearchInput, arguments_as_object, schema_hint, tool_search_output, unknown_tool_error};
+use marv_mcp::input::Confirmation;
 use marv_mcp::manager::McpManager;
-use marv_mcp::tool::McpTool;
+use marv_mcp::tool::{Confirmer, McpTool};
 use marv_sandbox::TaintState;
 use marv_tools::output::cut_for_call;
 use marv_tools::schema_repair::check_required;
-use marv_tools::{Preview, RepairMode, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput, ToolRef};
+use marv_tools::{
+    ApprovalRequest, Decision, Preview, RepairMode, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput, ToolRef,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -87,12 +91,62 @@ impl Tool for McpToolAdapter {
         self.tool.auto_safe() // never: yolo doesn't skip an MCP call
     }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let result = self.tool.run_whole(input.clone(), ctx.cancel.clone()).await.map_err(ToolError::new)?;
+        let ask = AskThePerson { ctx, label: self.tool.label(input) };
+        let result = self.tool.run_asking(input.clone(), ctx.cancel.clone(), &ask).await.map_err(ToolError::new)?;
         // Cut here, not in marv-mcp: a cut result is saved whole for read_file and grep (#61).
         let mut out = ToolOutput::ok(cut_for_call(&result.output, ctx, Provenance::Mcp), result.summary.unwrap_or_default());
         out.is_error = result.is_error;
         out.provenance = Provenance::Mcp;
         Ok(out)
+    }
+}
+
+/// A server's question during a call (Google's "allow this agent to read an email from outside your organization?",
+/// marv-mcp's `input`), asked through the approval prompt: yes is "Allow once", "don't ask again" is the server's
+/// "Always allow this tool" (it remembers that too), no is "Don't allow". A question without an allow choice isn't
+/// shown (declined). The question is the server's text, shown as the preview's text, never as Marv's words.
+struct AskThePerson<'a> {
+    ctx: &'a ToolContext,
+    label: String,
+}
+
+#[async_trait]
+impl Confirmer for AskThePerson<'_> {
+    async fn confirm(&self, tool: &McpTool, confirmation: &Confirmation) -> Option<String> {
+        let meanings = confirmation.meanings();
+        let once = meanings.once.clone()?;
+        let Some(approver) = &self.ctx.approver else { return meanings.no };
+        let (key, about) = tool.scope();
+        let title = confirmation.title.clone().unwrap_or_else(|| "Allow this?".into());
+        let request = ApprovalRequest {
+            tool: tool.name.clone(),
+            label: self.label.clone(),
+            preview: Preview {
+                title: format!("{} asks: {title}", printable(&tool.server)),
+                text: Some(confirmation.message.clone()),
+                note: Some(format!("The {} server asks you before it hands this over", printable(&tool.server))),
+                ..Preview::default()
+            },
+            scope: Scope {
+                key: format!("mcp-ask:{key}"),
+                description: format!("{about} ({} remembers this too)", printable(&tool.server)),
+            },
+            agent: None,
+            network: false,
+            once: meanings.always.is_none(),
+            // The server's question is the person's to answer (it's their consent the server asks for): yolo, a
+            // grant or an "always" Marv remembered never answers it. Their "always" is the server's to keep.
+            must_ask: true,
+            protected: None,
+            door: None,
+            reason: false,
+            persists: false,
+        };
+        match approver.approve(request).await {
+            Decision::Yes => Some(once),
+            Decision::Always => meanings.always.or(Some(once)),
+            Decision::No | Decision::Declined(_) | Decision::Unavailable => meanings.no,
+        }
     }
 }
 
@@ -380,6 +434,89 @@ mod tests {
             );
         }
         assert!(taint.is_tainted());
+    }
+
+    /// Google's Gmail server: a confirmation first, then the mail once the retry carries an allow (the value it chose).
+    struct Asking(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl marv_mcp::tool::McpCaller for Asking {
+        async fn call(
+            &self,
+            _tool: &str,
+            _args: Map<String, Value>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> marv_mcp::Result<marv_mcp::tool::McpCallResult> {
+            Ok(serde_json::from_value(json!({"content": [], "structuredContent": {"inputRequiredResult": {
+                "inputRequests": {"approval_choice": {"elicitRequest": {
+                    "message": "This agent wants to read **\"Lunch?\"** from an external user. Do you want to allow this?",
+                    "requestedSchema": {"approval_choice": {"enumSchema": {
+                        "enumList": ["ALLOW_ONCE", "ALLOW_RESOURCE_ALWAYS", "ALLOW_TOOL_ALWAYS", "DENY_ONCE"],
+                        "enumNames": ["Allow once", "Always allow for this email", "Always allow this tool", "Don't allow"],
+                        "title": "Allow this app to use search_threads for this email?"
+                    }}}
+                }}},
+                "requestState": "s"
+            }}}))
+            .unwrap())
+        }
+        async fn call_answering(
+            &self,
+            _tool: &str,
+            _args: Map<String, Value>,
+            answers: &marv_mcp::input::Answers,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> marv_mcp::Result<marv_mcp::tool::McpCallResult> {
+            let chosen = answers.responses["approval_choice"]["content"]["approval_choice"].as_str().unwrap_or("none");
+            self.0.lock().unwrap().push(chosen.to_string());
+            let block = marv_mcp::tool::ContentBlock { kind: "text".into(), text: Some("Lunch?".into()), ..Default::default() };
+            Ok(marv_mcp::tool::McpCallResult { content: vec![block], ..Default::default() })
+        }
+    }
+
+    struct Answering(Decision, std::sync::Mutex<Vec<ApprovalRequest>>);
+    #[async_trait]
+    impl marv_tools::Approver for Answering {
+        async fn approve(&self, request: ApprovalRequest) -> Decision {
+            self.1.lock().unwrap().push(request);
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_servers_question_is_asked_through_the_approval_and_always_is_its_always_allow() {
+        let server = marv_mcp::config::parse_server(
+            "gmail",
+            &json!({"type": "http", "url": "https://gmailmcp.googleapis.com/mcp/v1"}),
+            marv_mcp::config::ServerSource::Personal,
+            &|_| None,
+            "f",
+        )
+        .unwrap();
+        for (decision, sent) in [(Decision::Yes, "ALLOW_ONCE"), (Decision::Always, "ALLOW_TOOL_ALWAYS")] {
+            let info = marv_mcp::tool::McpToolInfo {
+                name: "search_threads".into(),
+                description: None,
+                input_schema: Map::new(),
+                annotations: None,
+            };
+            let caller = Arc::new(Asking(std::sync::Mutex::default()));
+            let adapter = McpToolAdapter {
+                tool: marv_mcp::tool::make_mcp_tool(&server, info, caller.clone()),
+                taint: Arc::new(TaintState::new()),
+            };
+            let approver = Arc::new(Answering(decision, std::sync::Mutex::default()));
+            let ctx = ToolContext { approver: Some(approver.clone()), ..ToolContext::new("/nonexistent/p") };
+            let out = adapter.run(&Map::new(), &ctx).await.unwrap();
+            assert_eq!(out.output, "Lunch?");
+            assert_eq!(*caller.0.lock().unwrap(), [sent]);
+            let asked = approver.1.lock().unwrap();
+            let request = &asked[0];
+            assert_eq!(request.preview.title, "gmail asks: Allow this app to use search_threads for this email?");
+            assert!(request.preview.text.as_deref().unwrap().contains("from an external user"));
+            assert_eq!(request.scope.key, "mcp-ask:mcp:gmail:search_threads");
+            assert!(request.must_ask, "yolo or a remembered scope never answers the server's question");
+            assert!(!request.once, "Google offers an always");
+        }
     }
 
     /// A server that answers every call with a JSON-RPC error whose message is its own text.

@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::McpError;
+use crate::input::{Answers, CAPABILITIES_META, PROTOCOL_META, STATELESS_PROTOCOL, client_capabilities};
 use crate::jsonrpc::{
     CallToolParams, Implementation, InitializeParams, InitializeResult, ListToolsResult, Message, Notification, PROTOCOL_VERSION,
     Request, RequestId, Response, RpcError, code, encode_line, method,
@@ -129,6 +130,11 @@ struct HttpWire {
     session: Mutex<Option<String>>,
     protocol: Mutex<Option<String>>,
     auth: Option<tokio::sync::Mutex<McpOAuthProvider>>,
+}
+
+/// A server that answers each call on its own, in MCP's 2026-07-28 revision (Google's Workspace servers).
+fn stateless(url: &Url) -> bool {
+    url.scheme() == "https" && url.host_str().is_some_and(|h| h.ends_with(".googleapis.com"))
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -280,15 +286,34 @@ impl Client {
         Ok((result, schemas))
     }
 
-    /// One tool call; progress restarts `timeout`, `cancel` gives up (and tells the server).
+    /// One tool call; progress restarts `timeout`, `cancel` gives up (and tells the server). It says Marv can ask the
+    /// person ([`crate::input`]); `answers` is the retry of a call the server asked about.
     pub async fn call_tool(
         &self,
         name: &str,
         arguments: Map<String, Value>,
+        answers: Option<&Answers>,
         timeout: Duration,
         cancel: CancellationToken,
     ) -> crate::Result<McpCallResult> {
-        let params = serde_json::to_value(CallToolParams { name: name.into(), arguments })?;
+        let mut params = serde_json::to_value(CallToolParams { name: name.into(), arguments })?;
+        if let Value::Object(map) = &mut params {
+            let mut meta = json!({ CAPABILITIES_META: client_capabilities() });
+            // Google's Workspace servers answer a confirmation the way MCP's 2026-07-28 revision does only to a call
+            // that says it's in that revision: under the older one (what Marv's handshake asks for) they put the
+            // question in the tool's result and took no answer to it, asking again each time (seen 2026-11-27).
+            if let Wire::Http(w) = &self.inner.wire
+                && stateless(&w.url)
+            {
+                meta[PROTOCOL_META] = json!(STATELESS_PROTOCOL);
+                // Who's asking: there's no handshake in that revision to have said it (Google names the app in its question).
+                meta["io.modelcontextprotocol/clientInfo"] = json!({"name": "Marv", "version": env!("CARGO_PKG_VERSION")});
+            }
+            map.insert("_meta".into(), meta);
+            if let Some(answers) = answers {
+                answers.add_to(map);
+            }
+        }
         let opts = RequestOptions { timeout: Some(timeout), reset_on_progress: true, cancel: Some(cancel) };
         let raw = self.request(method::TOOLS_CALL, Some(params), opts).await?;
         serde_json::from_value(raw).map_err(|e| McpError::Server(format!("the server's result isn't MCP: {e}")))
@@ -335,7 +360,10 @@ impl Client {
             // The server only reports progress when asked, with a token: the request's own id.
             let p = params.get_or_insert_with(|| json!({}));
             if let Value::Object(map) = p {
-                map.insert("_meta".into(), json!({ "progressToken": id }));
+                let meta = map.entry("_meta").or_insert_with(|| json!({}));
+                if let Value::Object(meta) = meta {
+                    meta.insert("progressToken".into(), json!(id));
+                }
             }
             lock(&inner.progress).insert(id.clone(), progress_tx);
         }
@@ -538,7 +566,24 @@ impl HttpWire {
             if let Some(session) = lock(&self.session).clone() {
                 request = request.header("mcp-session-id", session);
             }
-            if let Some(protocol) = lock(&self.protocol).clone() {
+            // A request may say its own revision (a stateless call, above), and the header must match it.
+            let own = match message {
+                Message::Request(r) => r.params.as_ref().and_then(|p| p["_meta"][PROTOCOL_META].as_str()).map(String::from),
+                _ => None,
+            };
+            // That revision routes by headers that mirror the body (a server refuses a call without them: -32020
+            // "Header mismatch"): the method, and the tool's name. Names a header can't carry go without one.
+            if own.is_some()
+                && let Message::Request(r) = message
+            {
+                request = request.header("mcp-method", r.method.as_str());
+                if let Some(name) = r.params.as_ref().and_then(|p| p["name"].as_str())
+                    && name.bytes().all(|b| b.is_ascii_graphic())
+                {
+                    request = request.header("mcp-name", name);
+                }
+            }
+            if let Some(protocol) = own.or_else(|| lock(&self.protocol).clone()) {
                 request = request.header("mcp-protocol-version", protocol);
             }
             if let Some(auth) = &self.auth
@@ -573,6 +618,16 @@ impl HttpWire {
             }
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
+                // Google answers a disabled API with HTTP 403 *and* a JSON-RPC response: tools/list's full list, or
+                // a call's error result ("Gmail MCP API has not been used in project … or it is disabled"). That
+                // answer is read, so the model sees the server's reason instead of a cut-off body.
+                if let Message::Request(sent) = message
+                    && let Ok(Message::Response(reply)) = serde_json::from_str::<Message>(text.trim())
+                    && reply.id == sent.id
+                {
+                    Inner::dispatch(inner, Message::Response(reply), text.trim().to_string());
+                    return Ok(());
+                }
                 return Err(McpError::Server(format!(
                     "Error POSTing to endpoint (HTTP {}): {}",
                     status.as_u16(),
@@ -644,4 +699,16 @@ async fn read_events(inner: &Arc<Inner>, response: reqwest::Response, sent: &Mes
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_googles_workspace_servers_get_calls_in_the_stateless_revision() {
+        assert!(stateless(&Url::parse("https://gmailmcp.googleapis.com/mcp/v1").unwrap()));
+        assert!(!stateless(&Url::parse("https://googleapis.com.example.org/mcp").unwrap()));
+        assert!(!stateless(&Url::parse("http://127.0.0.1:9/mcp").unwrap()));
+    }
 }

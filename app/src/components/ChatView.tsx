@@ -655,6 +655,7 @@ function ChatTerminal({ chat, chatId }: { chat: Chat; chatId: string }) {
           cacheKey={key}
           run={run}
           scrollback={5000}
+          redrawKeys={chat.harness === "claude-code" ? "\x0c" : undefined}
           open={(cols, rows, onData) => desktop.chatTerminalOpen(chatId, cols, rows, onData)}
           onState={setState}
         />

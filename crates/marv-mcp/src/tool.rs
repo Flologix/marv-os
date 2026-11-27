@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::McpError;
 use crate::config::{McpServerConfig, ServerSource};
+use crate::input::{Answers, Confirmation, input_required};
 use crate::ordered::Ordered;
 use crate::text::{printable, sha256_hex, truncate};
 
@@ -114,13 +115,53 @@ pub struct McpCallResult {
     pub structured_content: Option<Value>,
     #[serde(default)]
     pub is_error: bool,
+    /// An `InputRequiredResult` in the draft's shape ([`crate::input`]): `input_required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_requests: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_state: Option<String>,
 }
 
 /// How a tool reaches its server: the manager's connection, by the server's own tool name.
 #[async_trait]
 pub trait McpCaller: Send + Sync {
     async fn call(&self, tool: &str, args: Map<String, Value>, cancel: CancellationToken) -> crate::Result<McpCallResult>;
+
+    /// The retry of a call the server asked about, with the person's answers ([`crate::input`]). A caller that can't
+    /// send answers sends the call again without them.
+    async fn call_answering(
+        &self,
+        tool: &str,
+        args: Map<String, Value>,
+        _answers: &Answers,
+        cancel: CancellationToken,
+    ) -> crate::Result<McpCallResult> {
+        self.call(tool, args, cancel).await
+    }
 }
+
+/// The person's answer to a server's question during a call ([`crate::input`]), through the session's approval
+/// prompt.
+#[async_trait]
+pub trait Confirmer: Send + Sync {
+    /// The value chosen from `confirmation`'s choices, or `None` to decline. `tool` is the asking tool.
+    async fn confirm(&self, tool: &McpTool, confirmation: &Confirmation) -> Option<String>;
+}
+
+/// No one to ask (a caller without a session): every question is declined.
+pub struct NoConfirmer;
+
+#[async_trait]
+impl Confirmer for NoConfirmer {
+    async fn confirm(&self, _tool: &McpTool, _confirmation: &Confirmation) -> Option<String> {
+        None
+    }
+}
+
+/// How many times one call may ask before Marv gives up on it (each question is the person's to answer).
+pub const MAX_QUESTIONS: usize = 12;
 
 /// Only characters every provider accepts.
 fn clean(text: &str) -> String {
@@ -379,16 +420,73 @@ impl McpTool {
 
     /// [`McpTool::run`] without the cap: the session cuts it, saving the whole output (#61).
     pub async fn run_whole(&self, args: Map<String, Value>, cancel: CancellationToken) -> Result<ToolResult, String> {
-        let result = match self.caller.call(&self.info.name, args, cancel).await {
-            Ok(r) => r,
-            // Marv's own sentence, as it is: the model should tell the user to log in, not retry.
-            Err(McpError::LoginNeeded(e)) => return Err(e.to_string()),
-            // Anything else can carry the server's own words (a JSON-RPC error's message): an error *result*, so the
-            // caller handles it as the server's text (fenced as data, tainting), not as Marv's.
-            Err(e) => {
-                let output = printable(&format!("{}'s {} failed: {e}", self.server, self.info.name));
-                return Ok(ToolResult { output, summary: Some("error".into()), is_error: true, images: Vec::new() });
+        self.run_asking(args, cancel, &NoConfirmer).await
+    }
+
+    /// [`McpTool::run_whole`], where the server may ask the person before it answers ([`crate::input`]): each
+    /// question goes to `confirmer`, and the call is sent again with the answers until a result comes (at most
+    /// [`MAX_QUESTIONS`] rounds). Google asks per email, so a search can ask several times. A question Marv can't
+    /// show, or the same question again after a "no", ends in an error result saying so.
+    pub async fn run_asking(
+        &self,
+        args: Map<String, Value>,
+        cancel: CancellationToken,
+        confirmer: &dyn Confirmer,
+    ) -> Result<ToolResult, String> {
+        let mut answers: Option<Answers> = None;
+        let mut declined: Vec<String> = Vec::new();
+        let mut allowed: Vec<String> = Vec::new();
+        let mut rounds = 0;
+        let result = loop {
+            let called = match &answers {
+                None => self.caller.call(&self.info.name, args.clone(), cancel.clone()).await,
+                Some(a) => self.caller.call_answering(&self.info.name, args.clone(), a, cancel.clone()).await,
+            };
+            let result = match called {
+                Ok(r) => r,
+                // Marv's own sentence, as it is: the model should tell the user to log in, not retry.
+                Err(McpError::LoginNeeded(e)) => return Err(e.to_string()),
+                // Anything else can carry the server's own words (a JSON-RPC error's message): an error *result*, so the
+                // caller handles it as the server's text (fenced as data, tainting), not as Marv's.
+                Err(e) => {
+                    let output = printable(&format!("{}'s {} failed: {e}", self.server, self.info.name));
+                    return Ok(ToolResult { output, summary: Some("error".into()), is_error: true, images: Vec::new() });
+                }
+            };
+            let asked = serde_json::to_value(&result).ok().and_then(|raw| input_required(&raw));
+            let Some(asked) = asked else { break result };
+            let refused = |why: String| {
+                let output = printable(&format!("{}'s {} didn't run: {why}", self.server, self.info.name));
+                Ok(ToolResult { output, summary: Some("not allowed".into()), is_error: true, images: Vec::new() })
+            };
+            let asked = match asked {
+                Ok(a) => a,
+                Err(why) => return refused(why),
+            };
+            // Asked again about what the person said no to: done, not asked twice.
+            if asked.confirmations.iter().any(|c| declined.contains(&c.message)) {
+                return refused("you didn't allow it.".into());
             }
+            // Asked again about what the person allowed: the server didn't take the answer, and asking on would only
+            // ask the person the same thing over and over.
+            if asked.confirmations.iter().any(|c| allowed.contains(&c.message)) {
+                return refused("the server asked again after you allowed it (it didn't take Marv's answer).".into());
+            }
+            rounds += 1;
+            if rounds > MAX_QUESTIONS {
+                return refused(format!("the server asked {MAX_QUESTIONS} times; ask for fewer items at once."));
+            }
+            let mut chosen = Vec::new();
+            for c in &asked.confirmations {
+                let value = confirmer.confirm(self, c).await;
+                if value.is_none() || value == c.meanings().no {
+                    declined.push(c.message.clone());
+                } else {
+                    allowed.push(c.message.clone());
+                }
+                chosen.push((c.key.clone(), value));
+            }
+            answers = Some(asked.answer(&chosen));
         };
         let output = mcp_result_text(&result);
         if result.is_error {
